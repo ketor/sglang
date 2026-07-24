@@ -73,6 +73,31 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _BypassLoadState:
+    """L2-bypass async read (increment 3): per-request in-flight device load.
+
+    Holds the background DeviceLoadTask, the parent-first l3-marker chain the load
+    covers, the pinned ancestor node (protects the whole chain up to root while the
+    GET runs across rounds), the device-token charge (for the rate-limit budget),
+    and the node id used as the load-back handle. Created when the background GET is
+    submitted; consumed at promotion (verified prefix -> device-resident) or abort."""
+
+    __slots__ = (
+        "task",
+        "nodes_to_load",
+        "ancestor",
+        "device_tokens",
+        "last_hit_node_id",
+    )
+
+    def __init__(self, task, nodes_to_load, ancestor, device_tokens, last_hit_node_id):
+        self.task = task
+        self.nodes_to_load = nodes_to_load
+        self.ancestor = ancestor
+        self.device_tokens = device_tokens
+        self.last_hit_node_id = last_hit_node_id
+
+
 class HiRadixCache(RadixCache):
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
@@ -195,6 +220,22 @@ class HiRadixCache(RadixCache):
         # record the ongoing prefetch requests
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
+        # L2-bypass (increment 2) device-direct read: requests whose L3 discovery
+        # (exist query -> l3_present markers) is deferred to the TP-synchronized
+        # scheduling loop. Keyed by req_id -> (anchor_node, prefetch_key, last_hash,
+        # prefix_keys). Filled by prefetch_from_storage (queue-add, collective-free),
+        # drained by check_prefetch_progress (safe place to all_reduce). Empty and
+        # inert unless self.l2_bypass.
+        self._pending_l3_discovery: Dict[str, tuple] = {}
+        # L2-bypass (increment 3) async device-direct read: requests whose exist
+        # discovery has run and whose on-demand SG GET is in flight on the
+        # background device-load thread. Keyed by req_id -> _BypassLoadState (the
+        # task handle, the marker chain being loaded, the pinned ancestor, and the
+        # device-token charge). Advanced round-by-round by check_prefetch_progress
+        # (each round a balanced TP MIN reduce over every rank's done flag), so the
+        # scheduler parks the request in the waiting queue until every rank's local
+        # GET has landed. Empty and inert unless async L2-bypass read is on.
+        self._bypass_load_state: Dict[str, _BypassLoadState] = {}
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
@@ -555,14 +596,28 @@ class HiRadixCache(RadixCache):
         try:
             for ack_id, node in list(self.ongoing_backup.items()):
                 try:
-                    node.release_host()
+                    if self.l2_bypass:
+                        # Bypass pins the GPU slot via lock_ref (not host_ref). Task 4:
+                        # the DSA sidecar is device-direct (no host staging to free).
+                        self.dec_lock_ref(node)
+                    else:
+                        node.release_host()
                 except Exception:
                     logger.exception(
-                        "Failed to release host protection for backup op %s", ack_id
+                        "Failed to release protection for backup op %s", ack_id
                     )
                 self.ongoing_backup.pop(ack_id, None)
         except Exception:
             logger.exception("Force release pending backup ops failed.")
+
+        # L2-bypass async read: release any in-flight device loads. The controller
+        # detach already stopped (joined) the background device-load thread, so each
+        # task's GET has finished; free the slots/staging, drop markers, unpin.
+        try:
+            for req_id in list(self._bypass_load_state.keys()):
+                self._abort_async_load(req_id)
+        except Exception:
+            logger.exception("Force release pending async device loads failed.")
 
     def _drain_storage_control_queues_local(self):
         """Drain storage control queues without TP synchronization.
@@ -611,7 +666,14 @@ class HiRadixCache(RadixCache):
                 ack_id = operation.id
                 entry = self.ongoing_backup.pop(ack_id, None)
                 if entry is not None:
-                    entry.release_host()
+                    if self.l2_bypass:
+                        # Deferred device-slot unlock: the device->L3 PUT has acked,
+                        # so the GPU slot is no longer an in-flight RDMA source and
+                        # may be evicted. (Pinned at write_backup via inc_lock_ref.)
+                        # Task 4: the DSA sidecar is device-direct (no host staging).
+                        self.dec_lock_ref(entry)
+                    else:
+                        entry.release_host()
                 if log_metrics and self.enable_storage_metrics:
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
@@ -727,6 +789,13 @@ class HiRadixCache(RadixCache):
         self.token_to_kv_pool_host.clear()
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
+        # Pending L2-bypass discoveries reference nodes of the tree being reset;
+        # drop them (the tree wipe below invalidates any anchor lock_ref).
+        self._pending_l3_discovery.clear()
+        # In-flight async device loads: cache_controller.reset() above joined the
+        # background device-load thread (so no GET is still running) and the KV pool
+        # is wiped below, so the tasks' GPU slots go with it. Just drop the handles.
+        self._bypass_load_state.clear()
         self.evictable_host_leaves.clear()
         super().reset()
 
@@ -781,7 +850,47 @@ class HiRadixCache(RadixCache):
             logger.warning("Hierarchical cache storage backend is not enabled.")
             return False
 
+    @property
+    def l2_bypass(self) -> bool:
+        """Device-direct write path is on (SGLANG_HICACHE_L2_BYPASS=1 + a backend
+        that advertises supports_device_transfer()). Resolved by the controller at
+        attach; read through so runtime attach/detach flips take effect."""
+        return getattr(self.cache_controller, "l2_bypass", False)
+
+    @property
+    def l2_bypass_sync_read(self) -> bool:
+        """When on (SGLANG_HICACHE_L2_BYPASS_SYNC_READ=1), the L2-bypass read stays
+        synchronous (increment 2: SG GET on the scheduler thread in init_load_back).
+        Off (default) uses the increment-3 async background-load read. Inert unless
+        l2_bypass."""
+        return getattr(self.cache_controller, "l2_bypass_sync_read", False)
+
+    def _node_l3_backed(self, node: TreeNode) -> bool:
+        """L2-bypass analogue of node.backuped: the node's KV has been handed to
+        the device->L3 write-through. Tracked on a dynamic attribute so the stock
+        TreeNode (radix_cache.py) is untouched; defaults False for stock nodes."""
+        return getattr(node, "l3_backed", False)
+
+    def _node_l3_present(self, node: TreeNode) -> bool:
+        """L2-bypass (increment 2) read-side marker: this node's KV was DISCOVERED
+        in L3 via an exist query (batch_exists) but is not device-resident here yet
+        — it has hash_value and l3_present=True, but no value and no host_value. On
+        a successful device-direct load the flag clears (node becomes device-
+        resident). Distinct from l3_backed (which means THIS instance wrote it)."""
+        return getattr(node, "l3_present", False)
+
+    def _node_l3_resident(self, node: TreeNode) -> bool:
+        """True if node's KV is retrievable from L3 by hash — either this instance
+        wrote it (l3_backed) or it was discovered via exist (l3_present). Both are
+        loadable device-direct; match_prefix climbs them and load_from_storage_device
+        reads them. (A node can be both after a self-written page is evicted then
+        re-discovered.)"""
+        return self._node_l3_backed(node) or self._node_l3_present(node)
+
     def write_backup(self, node: TreeNode, write_back=False) -> int:
+        if self.l2_bypass:
+            return self._write_backup_device(node, write_back)
+
         # Backup invariant (for write-through mode): backed-up nodes must form a
         # contiguous prefix from root — no gaps.  Skip if parent isn't backed
         # up yet;
@@ -812,6 +921,35 @@ class HiRadixCache(RadixCache):
             return 0
 
         return len(host_indices)
+
+    def _write_backup_device(self, node: TreeNode, write_back=False) -> int:
+        """L2-bypass write-through: no host slot. The GPU KV slot is handed to the
+        device->L3 backup and pinned (deferred unlock) as the RDMA source until the
+        PUT completes. Mirrors write_backup's tracking/locking but over the
+        l3_backed marker instead of host_value."""
+        # Contiguous L3 prefix invariant (parallel to the stock backuped-prefix):
+        # skip until the parent is L3-backed, so backed pages stay a gapless prefix.
+        if not write_back and (
+            node.parent != self.root_node and not self._node_l3_backed(node.parent)
+        ):
+            return 0
+
+        # Task 4: DSA/hybrid AND dense are now identical — the main MLA latent AND
+        # (for DSA) the indexer sidecar both go device-direct, riding the same GPU
+        # slots. No host staging is allocated for either. Enqueue the device-only
+        # write op (records the ack event; no D2H copy).
+        self.cache_controller.write_device(
+            device_indices=node.value, node_id=node.id
+        )
+        # Mark L3-backed at enqueue time, mirroring stock (backuped flips when
+        # host_value is set in write_backup, before the storage backup completes).
+        node.l3_backed = True
+        self._track_write_through_node(node, len(node.key))
+        if not write_back:
+            # Pin the GPU slot: it is the RDMA source and must stay unevictable
+            # until the device->L3 PUT acks (deferred dec_lock_ref at backup drain).
+            self.inc_lock_ref(node)
+        return len(node.value)
 
     def _track_write_through_node(self, node: TreeNode, backup_len: int) -> None:
         node.write_through_pending_id = node.id
@@ -850,14 +988,21 @@ class HiRadixCache(RadixCache):
         for node in publish_nodes:
             if node.write_through_pending_id == ack_id:
                 node.write_through_pending_id = None
-            # DMA confirmed -- block is now on host.
-            self._record_store_event(node, medium=StorageMedium.CPU)
+            if not self.l2_bypass:
+                # DMA confirmed -- block is now on host.
+                self._record_store_event(node, medium=StorageMedium.CPU)
         if self.enable_storage:
             self.write_backup_storage(lock_node, backup_len)
-        if release_lock:
+        # L2-bypass: the GPU slot is the RDMA source, so its lock is NOT released
+        # here (there was no D2H copy to make host the source of truth). The
+        # deferred dec_lock_ref happens at the storage-backup ack (_drain_backup).
+        if release_lock and not self.l2_bypass:
             self.dec_lock_ref(lock_node)
 
     def write_backup_storage(self, node: TreeNode, backup_len: Optional[int] = None):
+        if self.l2_bypass:
+            return self._write_backup_storage_device(node, backup_len)
+
         # Recover pre-split data via walk-and-concat if node was split.
         # prefix_keys anchored at chain top to avoid double-counting.
         if backup_len is None or len(node.key) == backup_len:
@@ -884,8 +1029,37 @@ class HiRadixCache(RadixCache):
         self.ongoing_backup[operation_id] = node
         node.protect_host()
 
-    def _concat_split_chain(self, node: TreeNode, backup_len: int):
-        """Recover enqueue-time key/hash/host by walking the split chain."""
+    def _write_backup_storage_device(
+        self, node: TreeNode, backup_len: Optional[int] = None
+    ):
+        """L2-bypass storage backup: hand DEVICE slot indices (not host_value) to
+        the backend. The GPU slot stays pinned (lock_ref) until this op acks, when
+        _drain_backup releases it. Snapshot the indices to CPU so the backup thread
+        needs no GPU sync. Task 4: the DSA indexer sidecar is device-direct and rides
+        these same slots (the backend derives it from _sidecar_entries()), so there is
+        no sidecar host staging to hand over."""
+        if backup_len is None or len(node.key) == backup_len:
+            top, key, hash_value = node, node.key, node.hash_value
+            device_value = node.value.detach().to("cpu")
+        else:
+            chain, top, key, hash_value = self._walk_split_chain(node, backup_len)
+            device_value = torch.cat([n.value for n in chain]).detach().to("cpu")
+
+        prefix_keys = (
+            top.get_prefix_hash_values(top.parent)
+            if self.hicache_storage_pass_prefix_keys
+            else None
+        )
+
+        operation_id = self.cache_controller.write_storage_device(
+            device_value, key, hash_value, prefix_keys
+        )
+        # Track by op id for the deferred device-slot unlock at _drain_backup.
+        # No protect_host(): the slot is pinned by lock_ref, not host_ref.
+        self.ongoing_backup[operation_id] = node
+
+    def _walk_split_chain(self, node: TreeNode, backup_len: int):
+        """Walk the split chain and recover enqueue-time (chain, top, key, hash)."""
         chain, accumulated = [], 0
         current = node
         while current is not self.root_node and accumulated < backup_len:
@@ -915,6 +1089,11 @@ class HiRadixCache(RadixCache):
                 hash_value.extend(n.hash_value)
         else:
             hash_value = None
+        return chain, top, key, hash_value
+
+    def _concat_split_chain(self, node: TreeNode, backup_len: int):
+        """Recover enqueue-time key/hash/host by walking the split chain."""
+        chain, top, key, hash_value = self._walk_split_chain(node, backup_len)
         host_value = torch.cat([n.host_value for n in chain])
         return top, key, hash_value, host_value
 
@@ -924,7 +1103,12 @@ class HiRadixCache(RadixCache):
             return
         node.hit_count += 1
 
-        if not node.backuped:
+        # In L2-bypass the node never carries host_value (backuped stays False), so
+        # gate on the l3_backed marker to avoid re-writing an already-backed page.
+        already_backed = node.backuped or (
+            self.l2_bypass and self._node_l3_backed(node)
+        )
+        if not already_backed:
             if node.hit_count >= self.write_through_threshold:
                 # write to host if the node is not backuped
                 self.write_backup(node)
@@ -1321,12 +1505,29 @@ class HiRadixCache(RadixCache):
         last_node = params.best_match_node
         mem_quota = params.mem_quota
         if last_node.evicted:
-            loading_values = self.load_back(last_node, mem_quota)
-            if loading_values is not None:
-                logger.debug(
-                    f"loading back {len(loading_values)} tokens for node {last_node.id}"
-                )
-                return loading_values, last_node
+            if self.l2_bypass:
+                loading_values = self.load_from_storage_device(last_node, mem_quota)
+                if loading_values is not None:
+                    # A transient/partial GET may have loaded only a prefix of the
+                    # matched markers (the failed suffix was dropped). Return the
+                    # DEEPEST device-resident node — climbing from best_match_node,
+                    # whose deeper markers may now be gone — so req.last_node is a
+                    # real device node and prefix_indices == loading_values length.
+                    end_node = last_node
+                    while end_node.evicted:
+                        end_node = end_node.parent
+                    logger.debug(
+                        f"device-direct loaded {len(loading_values)} tokens for "
+                        f"node {last_node.id}"
+                    )
+                    return loading_values, end_node
+            else:
+                loading_values = self.load_back(last_node, mem_quota)
+                if loading_values is not None:
+                    logger.debug(
+                        f"loading back {len(loading_values)} tokens for node {last_node.id}"
+                    )
+                    return loading_values, last_node
 
             while last_node.evicted:
                 last_node = last_node.parent
@@ -1335,6 +1536,159 @@ class HiRadixCache(RadixCache):
             self._empty_match_result.device_indices,
             last_node,
         )
+
+    def load_from_storage_device(
+        self, node: TreeNode, mem_quota: Optional[int] = None
+    ) -> Optional[torch.Tensor]:
+        """L2-bypass on-demand device-direct load (increment 2).
+
+        Walk the evicted L3-marker chain up from `node`, allocate GPU KV slots for
+        the whole span, and RDMA the pages straight into them via
+        cache_controller.load_device_direct (blocking SG GET). Mirrors load_back's
+        shape (ancestor pin, threshold/quota skip, all-or-nothing alloc) but the
+        source is L3, not the host pool.
+
+        TP correctness (the critical piece): before any loaded token is marked
+        usable, all-reduce MIN of (a) device-allocation success and (b) per-rank
+        verified page count. A shortfall on ANY rank truncates the usable prefix to
+        the MIN; the failed suffix's markers are dropped and recompute. No
+        partial-rank silent success (the failure vLLM's connector guards at
+        worker.py load — a rank that "loaded" fewer/short pages must not serve them).
+        Returns the loaded device indices (length == MIN verified prefix), or None
+        if nothing was verified across all ranks."""
+        start_time = time.perf_counter()
+        last_hit_node = node
+        nodes_to_load = []
+        while node.evicted:
+            assert self._node_l3_resident(node), (
+                f"evicted non-L3 node {node.id} in bypass load_from_storage_device"
+            )
+            assert node.hash_value is not None, (
+                f"L3 marker {node.id} missing hash_value"
+            )
+            nodes_to_load.insert(0, node)
+            node = node.parent
+        ancestor_node = node
+
+        result = self.inc_lock_ref(ancestor_node)
+        delta = result.delta
+
+        total_len = sum(len(n.key) for n in nodes_to_load)
+        if total_len < self.load_back_threshold or (
+            total_len > mem_quota + delta if mem_quota is not None else False
+        ):
+            # too small, or would blow the memory quota
+            self.dec_lock_ref(ancestor_node)
+            return None
+
+        # Page hashes, parent-first (contiguous prefix order).
+        hash_values: List[str] = []
+        for n in nodes_to_load:
+            hash_values.extend(n.hash_value)
+
+        device_indices, ok_pages = self.cache_controller.load_device_direct(
+            hash_values, node_id=last_hit_node.id
+        )
+        if device_indices is None:
+            # No device memory — evict and retry once (mirrors load_back).
+            self.evict(EvictParams(num_tokens=total_len))
+            device_indices, ok_pages = self.cache_controller.load_device_direct(
+                hash_values, node_id=last_hit_node.id
+            )
+
+        # TP alloc consistency: if ANY rank failed to allocate, all abort together
+        # (keeps the following MIN all_reduce balanced and avoids a per-rank prefix
+        # divergence). Every rank reaches this all_reduce (deterministic req order).
+        alloc_ok = torch.tensor(
+            1 if device_indices is not None else 0, dtype=torch.int
+        )
+        self._all_reduce_attn_groups(alloc_ok, torch.distributed.ReduceOp.MIN)
+        if alloc_ok.item() == 0:
+            if device_indices is not None:
+                self.cache_controller.free_device_indices(device_indices)
+            self.dec_lock_ref(ancestor_node)
+            logger.warning(
+                "load_from_storage_device: device alloc failed on >=1 rank for "
+                "node %d (%d tokens); recompute.",
+                last_hit_node.id,
+                total_len,
+            )
+            return None
+
+        # TP verified-prefix MIN: transient GET failures differ per rank, so the
+        # usable prefix is the minimum verified page count across ranks.
+        ok_pages_t = torch.tensor(ok_pages, dtype=torch.int)
+        self._all_reduce_attn_groups(ok_pages_t, torch.distributed.ReduceOp.MIN)
+        min_pages = ok_pages_t.item()
+        self.dec_lock_ref(ancestor_node)
+
+        verified_tokens = min_pages * self.page_size
+        if verified_tokens == 0:
+            self.cache_controller.free_device_indices(device_indices)
+            self._drop_l3_markers(nodes_to_load)
+            logger.warning(
+                "load_from_storage_device: 0 pages verified across ranks for node "
+                "%d; dropped %d markers, recompute.",
+                last_hit_node.id,
+                len(nodes_to_load),
+            )
+            return None
+
+        # Assign device slots to the verified prefix nodes; the failed suffix is
+        # dropped and recomputes.
+        offset = 0
+        loaded_nodes: List[TreeNode] = []
+        for n in nodes_to_load:
+            n_len = len(n.key)
+            if offset + n_len <= verified_tokens:
+                n.value = device_indices[offset : offset + n_len].clone()
+                n.l3_present = False  # now device-resident
+                # Read-hit => the page is IN L3; mark l3_backed so _inc_hit_count's
+                # already-backed gate skips the redundant post-read PUT (task 2).
+                n.l3_backed = True
+                self._record_store_event(n, medium=StorageMedium.GPU)
+                loaded_nodes.append(n)
+                offset += n_len
+            else:
+                break
+
+        # Free the unverified suffix's slots, drop its markers.
+        if offset < len(device_indices):
+            self.cache_controller.free_device_indices(device_indices[offset:])
+        if len(loaded_nodes) < len(nodes_to_load):
+            dropped = nodes_to_load[len(loaded_nodes) :]
+            self._drop_l3_markers(dropped)
+            logger.warning(
+                "load_from_storage_device: partial verify (%d/%d pages) for node "
+                "%d; dropped %d suffix markers, tail recomputes.",
+                min_pages,
+                len(nodes_to_load),
+                last_hit_node.id,
+                len(dropped),
+            )
+
+        self.evictable_size_ += offset
+        loaded_indices = device_indices[:offset]
+
+        last_loaded = loaded_nodes[-1]
+        # inc_lock_ref(last_loaded) pins the whole chain up to root (all loaded
+        # nodes are ancestors of last_loaded), and loading_check dec_lock_refs it
+        # once — so only last_loaded is tracked in ongoing_load_back, matching the
+        # single-node-id contract of load_back / cache_controller.load.
+        self.ongoing_load_back[last_loaded.id] = last_loaded
+        self.inc_lock_ref(last_loaded)
+        # Hand the loaded span to start_loading() for the ONE-event fence pass.
+        self.cache_controller.enqueue_device_load(
+            loaded_indices, node_ids=[last_loaded.id]
+        )
+
+        if self.metrics_collector is not None:
+            self.metrics_collector.observe_load_back_duration(
+                time.perf_counter() - start_time
+            )
+            self.metrics_collector.increment_load_back_num_tokens(offset)
+
+        return loaded_indices
 
     def query_storage_hit_length(
         self,
@@ -1476,7 +1830,343 @@ class HiRadixCache(RadixCache):
         can_terminate = can_terminate or operation_terminated
         return can_terminate
 
+    def _run_l3_discovery(self, req_id: str) -> bool:
+        """L2-bypass discovery: run the exist query for a pending request, gate it
+        (threshold + cross-rank MIN), and materialize l3_present marker nodes for
+        the hit prefix. Returns True (discovery is synchronous — the scheduler never
+        waits a round for it; the SUBSEQUENT device-direct load is what can delay,
+        gated by is_load_back_event_done). Called only from check_prefetch_progress,
+        which runs in the TP-synchronized scheduling loop, so the MIN all_reduce is
+        balanced and collective-safe (same place stock does its prefetch all_reduce)."""
+        pending = self._pending_l3_discovery.pop(req_id, None)
+        if pending is None:
+            return True
+        last_host_node, prefetch_key, last_hash, prefix_keys = pending
+        try:
+            # DSA/hybrid: carry the sidecar pool_transfers so the exist query goes
+            # through batch_exists_v2 and a page counts as present only if BOTH the
+            # main KV (@sg0) AND the DSA indexer are in L3 — otherwise the later
+            # device-direct load would miss the indexer. Dense uses the plain op.
+            prefetch_op_cls = (
+                HybridPrefetchOperation
+                if isinstance(self.cache_controller, HybridCacheController)
+                else PrefetchOperation
+            )
+            extra_kwargs = {}
+            if prefetch_op_cls is HybridPrefetchOperation:
+                extra_kwargs["pool_transfers"] = self._get_extra_pools().get(
+                    "extra_pools"
+                )
+            operation = prefetch_op_cls(
+                req_id,
+                self.cache_controller.mem_pool_host.get_dummy_flat_data_page()[:0],
+                prefetch_key,
+                last_hash,
+                prefix_keys,
+                **extra_kwargs,
+            )
+            # Exist query (gate #3 raw: longest present prefix on THIS rank).
+            hash_values, storage_hit_count = self.cache_controller._storage_hit_query(
+                operation
+            )
+            # Cross-rank MIN (gate #3): a page is only usable if every attn rank
+            # holds it. Main-thread NCCL, mirroring query_storage_hit_length.
+            hit_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
+            self._all_reduce_attn_groups(hit_tensor, torch.distributed.ReduceOp.MIN)
+            storage_hit_count = hit_tensor.item()
+            storage_hit_count -= storage_hit_count % self.page_size
+
+            # Gate #2 (threshold): don't pollute the tree with markers for a hit
+            # too small to be worth an on-demand load.
+            if storage_hit_count >= self.prefetch_threshold:
+                fetched_key = prefetch_key[:storage_hit_count]
+                matched_length = self._insert_helper_l3(
+                    last_host_node,
+                    fetched_key,
+                    hash_values[: storage_hit_count // self.page_size],
+                )
+                # Tokens newly discovered in L3 (not already in the tree) — the
+                # L3-hit signal the scheduler reads via pop_prefetch_loaded_tokens.
+                self.prefetch_loaded_tokens_by_reqid[req_id] = (
+                    storage_hit_count - matched_length
+                )
+                if self.enable_storage_metrics:
+                    self.storage_metrics_collector.log_prefetched_tokens(
+                        storage_hit_count - matched_length
+                    )
+        finally:
+            # Release the anchor pin taken in prefetch_from_storage.
+            self.dec_lock_ref(last_host_node)
+        return True
+
+    # ---- Increment 3: async device-direct read state machine -------------------
+
+    def _l3_exist_query(
+        self, req_id, last_host_node, prefetch_key, last_hash, prefix_keys
+    ):
+        """Run the L3 exist query for a discovered prefix + cross-rank MIN (gate #3),
+        page-aligned. Returns (hash_values, storage_hit_count). Same op shape as
+        _run_l3_discovery / query_storage_hit_length; the DSA/hybrid branch carries
+        the sidecar pool_transfers so a page counts present only if BOTH the main KV
+        (@sg0) and the indexer are in L3."""
+        prefetch_op_cls = (
+            HybridPrefetchOperation
+            if isinstance(self.cache_controller, HybridCacheController)
+            else PrefetchOperation
+        )
+        extra_kwargs = {}
+        if prefetch_op_cls is HybridPrefetchOperation:
+            extra_kwargs["pool_transfers"] = self._get_extra_pools().get("extra_pools")
+        operation = prefetch_op_cls(
+            req_id,
+            self.cache_controller.mem_pool_host.get_dummy_flat_data_page()[:0],
+            prefetch_key,
+            last_hash,
+            prefix_keys,
+            **extra_kwargs,
+        )
+        hash_values, storage_hit_count = self.cache_controller._storage_hit_query(
+            operation
+        )
+        hit_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
+        self._all_reduce_attn_groups(hit_tensor, torch.distributed.ReduceOp.MIN)
+        storage_hit_count = hit_tensor.item()
+        storage_hit_count -= storage_hit_count % self.page_size
+        return hash_values, storage_hit_count
+
+    def _advance_l3_async(self, req_id: str) -> bool:
+        """Async read dispatcher (bypass, async mode). The FIRST call for a request
+        runs discovery + submits the background GET and returns False (park); each
+        SUBSEQUENT call polls the background completion, returning False until every
+        rank's local load has landed, then promotes and returns True."""
+        if req_id in self._pending_l3_discovery:
+            return self._start_l3_async_load(req_id)
+        if req_id in self._bypass_load_state:
+            return self._poll_l3_async_load(req_id)
+        # No discovery was queued for this req, or it already promoted/aborted.
+        return True
+
+    def _start_l3_async_load(self, req_id: str) -> bool:
+        """Round 1: exist-discover, insert l3 markers, allocate GPU slots, submit the
+        background SG GET. Returns False (park) once a load is in flight, or True if
+        there is nothing to load (recompute). Collectives this round: the exist MIN
+        (in _l3_exist_query) and — only when a load is submitted — the alloc-success
+        MIN; both are TP-balanced because the branch is taken on post-MIN state."""
+        pending = self._pending_l3_discovery.pop(req_id, None)
+        if pending is None:
+            return True
+        last_host_node, prefetch_key, last_hash, prefix_keys = pending
+
+        hash_values, storage_hit_count = self._l3_exist_query(
+            req_id, last_host_node, prefetch_key, last_hash, prefix_keys
+        )
+        # Gate #2 (threshold): too small to be worth an on-demand load.
+        if storage_hit_count < self.prefetch_threshold:
+            self.dec_lock_ref(last_host_node)
+            return True
+
+        fetched_key = prefetch_key[:storage_hit_count]
+        matched_length = self._insert_helper_l3(
+            last_host_node,
+            fetched_key,
+            hash_values[: storage_hit_count // self.page_size],
+        )
+        # The L3-hit signal the scheduler reads via pop_prefetch_loaded_tokens.
+        self.prefetch_loaded_tokens_by_reqid[req_id] = storage_hit_count - matched_length
+        if self.enable_storage_metrics:
+            self.storage_metrics_collector.log_prefetched_tokens(
+                storage_hit_count - matched_length
+            )
+
+        # Collect the evicted l3-marker chain to load (parent-first): climb from the
+        # deepest matched node up through contiguous evicted l3 nodes.
+        _, best_node = self._match_prefix_helper(last_host_node, fetched_key)
+        nodes_to_load: List[TreeNode] = []
+        node = best_node
+        while node is not self.root_node and node.evicted:
+            assert self._node_l3_resident(node), (
+                f"evicted non-L3 node {node.id} in async discovery"
+            )
+            assert node.hash_value is not None, f"L3 marker {node.id} missing hash"
+            nodes_to_load.insert(0, node)
+            node = node.parent
+        ancestor = node
+
+        if not nodes_to_load:
+            # Whole discovered prefix is already device-resident; nothing to load.
+            # (Every rank reaches this identically — the tree is TP-symmetric — so no
+            # alloc MIN is issued on any rank.)
+            self.dec_lock_ref(last_host_node)
+            return True
+
+        # Pin the ancestor for the whole loading window (protects the chain up to
+        # root, incl. last_host_node's path when it lies above the ancestor), then
+        # drop the discovery-time anchor pin.
+        self.inc_lock_ref(ancestor)
+        self.dec_lock_ref(last_host_node)
+
+        hvs: List[str] = []
+        for n in nodes_to_load:
+            hvs.extend(n.hash_value)
+        total_tokens = len(hvs) * self.page_size
+
+        # Allocate GPU slots (evict + retry once, mirroring load_back).
+        task = self.cache_controller.make_device_load_task(hvs)
+        if task is None:
+            self.evict(EvictParams(num_tokens=total_tokens))
+            task = self.cache_controller.make_device_load_task(hvs)
+
+        # TP alloc consistency: if ANY rank failed to allocate, all abort together
+        # (keeps the subsequent per-round done MIN balanced and avoids per-rank
+        # prefix divergence). Every rank reaches this MIN (deterministic req order).
+        alloc_ok = torch.tensor(1 if task is not None else 0, dtype=torch.int)
+        self._all_reduce_attn_groups(alloc_ok, torch.distributed.ReduceOp.MIN)
+        if alloc_ok.item() == 0:
+            if task is not None:
+                self.cache_controller.free_device_load(task)
+            self._drop_l3_markers(nodes_to_load)
+            self.dec_lock_ref(ancestor)
+            self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
+            logger.warning(
+                "async l3 load: device alloc failed on >=1 rank (%d tokens); recompute.",
+                total_tokens,
+            )
+            return True
+
+        # Hand the GET to the background thread; park until it lands.
+        self.cache_controller.submit_device_load(task)
+        self.cache_controller.prefetch_tokens_occupied += total_tokens
+        self._bypass_load_state[req_id] = _BypassLoadState(
+            task=task,
+            nodes_to_load=nodes_to_load,
+            ancestor=ancestor,
+            device_tokens=total_tokens,
+            last_hit_node_id=nodes_to_load[-1].id,
+        )
+        return False
+
+    def _poll_l3_async_load(self, req_id: str) -> bool:
+        """Rounds 2..N: one balanced TP MIN over every rank's 0/1 background-done
+        flag. Park (return False) until the slowest rank's local GET has landed;
+        then promote."""
+        state = self._bypass_load_state[req_id]
+        local_done = 1 if state.task.done.is_set() else 0
+        done_t = torch.tensor(local_done, dtype=torch.int)
+        self._all_reduce_attn_groups(done_t, torch.distributed.ReduceOp.MIN)
+        if done_t.item() == 0:
+            return False
+        return self._promote_l3_async_load(req_id, state)
+
+    def _promote_l3_async_load(self, req_id: str, state: _BypassLoadState) -> bool:
+        """Final round: verified-prefix MIN, sidecar H2D (DSA), assign the verified
+        marker prefix as device-resident, drop the failed suffix, enqueue the fence,
+        release the ancestor pin. Returns True (the request may now be scheduled)."""
+        task = state.task
+        nodes_to_load = state.nodes_to_load
+        ancestor = state.ancestor
+
+        # Release the device-token charge (gate #1 budget) regardless of outcome.
+        self.cache_controller.prefetch_tokens_occupied -= state.device_tokens
+        if self.cache_controller.prefetch_tokens_occupied < 0:
+            self.cache_controller.prefetch_tokens_occupied = 0
+        self._bypass_load_state.pop(req_id, None)
+
+        # TP verified-prefix MIN: transient short reads differ per rank, so the
+        # usable prefix is the minimum verified page count across ranks.
+        ok_pages_t = torch.tensor(task.ok_pages, dtype=torch.int)
+        self._all_reduce_attn_groups(ok_pages_t, torch.distributed.ReduceOp.MIN)
+        min_pages = ok_pages_t.item()
+        verified_tokens = min_pages * self.page_size
+
+        if verified_tokens == 0:
+            self.cache_controller.free_device_load(task)
+            self._drop_l3_markers(nodes_to_load)
+            self.dec_lock_ref(ancestor)
+            self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
+            logger.warning(
+                "async l3 load: 0 pages verified across ranks for req %s; dropped "
+                "%d markers, recompute.",
+                req_id,
+                len(nodes_to_load),
+            )
+            return True
+
+        # DSA/hybrid: H2D the verified sidecar prefix on THIS (scheduler) thread.
+        self.cache_controller.finalize_device_load(task, min_pages)
+
+        device_indices = task.device_indices
+        offset = 0
+        loaded_nodes: List[TreeNode] = []
+        for n in nodes_to_load:
+            n_len = len(n.key)
+            if offset + n_len <= verified_tokens:
+                n.value = device_indices[offset : offset + n_len].clone()
+                n.l3_present = False  # now device-resident
+                # Read-hit => the page is IN L3 (we just read it), so mark it
+                # l3_backed: _inc_hit_count's already-backed gate then skips the
+                # redundant write-through/backup PUT after this read (task 2).
+                n.l3_backed = True
+                self._record_store_event(n, medium=StorageMedium.GPU)
+                loaded_nodes.append(n)
+                offset += n_len
+            else:
+                break
+
+        # Free the unverified suffix's slots; drop its markers so the tail recomputes.
+        if offset < len(device_indices):
+            self.cache_controller.free_device_indices(device_indices[offset:])
+        if len(loaded_nodes) < len(nodes_to_load):
+            dropped = nodes_to_load[len(loaded_nodes) :]
+            self._drop_l3_markers(dropped)
+            logger.warning(
+                "async l3 load: partial verify (%d/%d pages) for req %s; dropped %d "
+                "suffix markers, tail recomputes.",
+                min_pages,
+                len(nodes_to_load),
+                req_id,
+                len(dropped),
+            )
+
+        self.evictable_size_ += offset
+        last_loaded = loaded_nodes[-1]
+        # inc_lock_ref(last_loaded) pins the whole loaded chain up to root; the
+        # stock loading_check dec_lock_refs it once when the fence event fires.
+        self.ongoing_load_back[last_loaded.id] = last_loaded
+        self.inc_lock_ref(last_loaded)
+        self.cache_controller.enqueue_device_load(
+            device_indices[:offset], node_ids=[last_loaded.id]
+        )
+        # Release the ancestor pin held across the loading window.
+        self.dec_lock_ref(ancestor)
+        return True
+
+    def _abort_async_load(self, req_id: str) -> None:
+        """Tear down an in-flight async device load (abort/detach). Wait for the
+        background GET to finish before freeing its GPU slots (the NIC may still be
+        writing them; the GET is a bounded RDMA op), then free slots + staging, drop
+        the markers, release the ancestor pin and the device-token charge."""
+        state = self._bypass_load_state.pop(req_id, None)
+        if state is None:
+            return
+        # Bounded wait: don't free slots out from under an in-flight RDMA write.
+        state.task.done.wait(timeout=30)
+        self.cache_controller.free_device_load(state.task)
+        self._drop_l3_markers(state.nodes_to_load)
+        self.dec_lock_ref(state.ancestor)
+        self.cache_controller.prefetch_tokens_occupied -= state.device_tokens
+        if self.cache_controller.prefetch_tokens_occupied < 0:
+            self.cache_controller.prefetch_tokens_occupied = 0
+
     def check_prefetch_progress(self, req_id: str) -> bool:
+        if self.l2_bypass:
+            if self.l2_bypass_sync_read:
+                # Increment 2: exist-discover synchronously; the SG GET runs later
+                # on the scheduler thread in init_load_back.
+                return self._run_l3_discovery(req_id)
+            # Increment 3: exist-discover + submit background GET, then park the
+            # request across rounds until every rank's local load is done.
+            return self._advance_l3_async(req_id)
+
         if req_id not in self.ongoing_prefetch:
             # there is no ongoing prefetch for this request or it has been revoked
             return True
@@ -1568,10 +2258,26 @@ class HiRadixCache(RadixCache):
         host_hit_length = 0
         last_host_node = last_node
         while last_node.evicted:
-            host_hit_length += len(last_node.host_value)
+            if last_node.backuped:
+                host_hit_length += len(last_node.host_value)
+            else:
+                # L2-bypass l3 marker (or self-written page evicted from device):
+                # no host_value, so count the node's own tokens by key length.
+                assert self.l2_bypass and self._node_l3_resident(last_node), (
+                    f"evicted non-backuped node {last_node.id} outside L2-bypass"
+                )
+                host_hit_length += len(last_node.key)
             last_node = last_node.parent
-        while not last_host_node.backuped:
-            last_host_node = last_host_node.parent
+        if self.l2_bypass:
+            # Climb to the deepest L3-resident (or, if some page is host-backed on a
+            # mixed instance, backuped) node — the load-back start node.
+            while not (
+                last_host_node.backuped or self._node_l3_resident(last_host_node)
+            ):
+                last_host_node = last_host_node.parent
+        else:
+            while not last_host_node.backuped:
+                last_host_node = last_host_node.parent
 
         return MatchResult(
             device_indices=value,
@@ -1603,6 +2309,28 @@ class HiRadixCache(RadixCache):
             or prefetch_length < self.prefetch_threshold
             or self.cache_controller.prefetch_rate_limited()
         ):
+            return
+
+        logger.debug(
+            "[l2bypass] prefetch_from_storage req=%s l2_bypass=%s len=%d",
+            req_id, self.l2_bypass, prefetch_length,
+        )
+        if self.l2_bypass:
+            # Device-direct read: do NOT prefetch into host (that reintroduces L2)
+            # and do NOT speculatively reserve HBM. Only RECORD the discovery intent
+            # here; the exist query + its cross-rank MIN all_reduce + marker insert
+            # run in check_prefetch_progress, which is inside the TP-synchronized
+            # scheduling loop (queue-add has no such guarantee, and a collective
+            # here could interleave with a concurrent forward's collectives). Pin
+            # the anchor with a device lock_ref so it is not evicted before the
+            # marker insert re-anchors from it; released in _run_l3_discovery.
+            self.inc_lock_ref(last_host_node)
+            self._pending_l3_discovery[req_id] = (
+                last_host_node,
+                prefetch_key,
+                last_hash,
+                prefix_keys,
+            )
             return
 
         last_host_node.protect_host()
@@ -1684,6 +2412,68 @@ class HiRadixCache(RadixCache):
 
         return matched_length
 
+    def _insert_helper_l3(
+        self, node: TreeNode, key: RadixKey, hash_value
+    ) -> int:
+        """L2-bypass (increment 2) marker insert: the device-direct read analogue
+        of _insert_helper_host. Records that the [key] prefix is resident in L3 by
+        creating a marker node with hash_value but NO host slot and NO device value
+        (value=None => evicted; host_value=None => not backuped; l3_present=True).
+        match_prefix climbs these; load_from_storage_device turns them device-
+        resident on demand. Returns the length already present in the tree (device
+        or existing marker); the remainder is the newly discovered L3 suffix."""
+        node.last_access_time = time.monotonic()
+        if len(key) == 0:
+            return 0
+
+        child_key = key.child_key(self.page_size)
+
+        matched_length = 0
+        while len(key) > 0 and child_key in node.children.keys():
+            node = node.children[child_key]
+            node.last_access_time = time.monotonic()
+            prefix_len = node.key.match(key, page_size=self.page_size)
+            key = key[prefix_len:]
+            hash_value = hash_value[prefix_len // self.page_size :]
+            matched_length += prefix_len
+
+            if prefix_len < len(node.key):
+                new_node = self._split_node(node.key, node, prefix_len)
+                node = new_node
+
+            if len(key):
+                child_key = key.child_key(self.page_size)
+
+        if len(key):
+            new_node = TreeNode(priority=node.priority)
+            new_node.parent = node
+            new_node.key = key
+            new_node.value = None  # not device-resident (marker only)
+            new_node.host_value = None  # no host slot in bypass
+            new_node.hash_value = hash_value
+            new_node.l3_present = True  # discovered in L3 via exist
+            node.children[child_key] = new_node
+            self._update_leaf_status(node)
+
+        return matched_length
+
+    def _drop_l3_markers(self, nodes: List[TreeNode]) -> None:
+        """Drop L3 marker nodes whose device-direct load failed or was truncated,
+        so their tokens recompute instead of serving unverified KV. Detach deepest
+        first (a parent is only removed after its child marker), and only childless
+        markers that are still evicted (never became device-resident)."""
+        for n in reversed(nodes):
+            n.l3_present = False
+            if (
+                n.value is None
+                and len(n.children) == 0
+                and n.parent is not None
+            ):
+                child_key = n.key.child_key(self.page_size)
+                if n.parent.children.get(child_key) is n:
+                    n.parent.children.pop(child_key, None)
+                    self._update_leaf_status(n.parent)
+
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
         child_key = key.child_key(self.page_size)
@@ -1729,6 +2519,10 @@ class HiRadixCache(RadixCache):
             new_node.host_value = child.host_value[:split_len].clone()
             child.host_value = child.host_value[split_len:].clone()
 
+        # Task 4: the DSA indexer sidecar is device-direct (rides the KV device slots),
+        # so there is no sidecar host staging to split alongside value — the split of
+        # node.value below covers the sidecar's slots implicitly.
+
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
@@ -1738,6 +2532,20 @@ class HiRadixCache(RadixCache):
 
         if child.backuped:
             self._replace_pending_write_through_node(child, [new_node, child])
+        elif self.l2_bypass and self._node_l3_backed(child):
+            # L2-bypass has no host_value to split, but the l3_backed marker and the
+            # pending write-through/backup tracking must still propagate to both
+            # halves so the contiguous-L3-prefix invariant and the deferred unlock
+            # stay consistent across the split.
+            new_node.l3_backed = True
+            self._replace_pending_write_through_node(child, [new_node, child])
+
+        if self.l2_bypass and self._node_l3_present(child):
+            # Read-side L3 marker (increment 2): propagate the discovered flag to
+            # the new parent half so match_prefix keeps climbing it (child keeps
+            # its own flag; hash_value is split by split_node_hash_value above).
+            # No write-through tracking — this instance is not writing the page.
+            new_node.l3_present = True
 
         return new_node
 
@@ -1828,6 +2636,18 @@ class HiRadixCache(RadixCache):
     def release_aborted_request(self, rid: str):
         # Clean up storage hit tracking for aborted request
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+
+        # L2-bypass: a request aborted between queue-add and discovery still holds
+        # the anchor pin taken in prefetch_from_storage; release it.
+        pending = self._pending_l3_discovery.pop(rid, None)
+        if pending is not None:
+            self.dec_lock_ref(pending[0])
+
+        # L2-bypass async read: a request aborted mid-load still owns GPU slots (the
+        # background GET may be writing them), the ancestor pin, and the device-token
+        # charge. Release all of it. Aborts are broadcast to every rank, so the
+        # dec_lock_ref / marker drop stay TP-symmetric with no collective here.
+        self._abort_async_load(rid)
 
         if rid not in self.ongoing_prefetch:
             return
