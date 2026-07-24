@@ -14,6 +14,7 @@ limitations under the License.
 """
 
 import logging
+import os
 import threading
 import time
 from functools import cache
@@ -38,6 +39,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     is_dp_attention_enabled,
 )
+from sglang.srt.mem_cache.device_page_meta import consecutive_ok_pages
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
@@ -65,6 +67,58 @@ def make_timing_event_pair():
     timing_enabled = _timing_events_supported()
     kwargs = {"enable_timing": True} if timing_enabled else {}
     return device_module.Event(**kwargs), device_module.Event(**kwargs), timing_enabled
+
+
+def env_l2_bypass() -> bool:
+    """Prototype flag: SGLANG_HICACHE_L2_BYPASS=1 requests the device-direct
+    (L2-bypass) write path. Read once at controller/cache init; effective only if
+    the storage backend also advertises supports_device_transfer()."""
+    return os.environ.get("SGLANG_HICACHE_L2_BYPASS", "0").strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def env_l2_bypass_sync_read() -> bool:
+    """Escape hatch: SGLANG_HICACHE_L2_BYPASS_SYNC_READ=1 reverts the L2-bypass
+    READ path to the increment-2 synchronous form (the on-demand SG GET runs on the
+    scheduler thread inside init_load_back). Default OFF => the increment-3 async
+    read path (background device-load thread; check_prefetch_progress parks the
+    request until every rank's local GET is done). Only meaningful when
+    SGLANG_HICACHE_L2_BYPASS=1; ignored otherwise. Provided for A/B and safety."""
+    return os.environ.get(
+        "SGLANG_HICACHE_L2_BYPASS_SYNC_READ", "0"
+    ).strip().lower() not in ("", "0", "false", "no", "off")
+
+
+class DeviceLoadTask:
+    """L2-bypass async read (increment 3): one on-demand device-direct load handed
+    to the background device-load thread.
+
+    Division of labor (the TP-safety contract): the SCHEDULER thread allocates the
+    GPU slots (and, for DSA, the transient sidecar host staging) and builds this
+    task; the BACKGROUND thread runs ONLY the blocking backend GET
+    (batch_get_v1_device / batch_get_v2_device) plus the local per-rank page
+    verification — NO CUDA stream ops, NO collectives. The scheduler thread then
+    does the TP MIN all_reduces, the sidecar H2D (DSA), and the radix-tree
+    promotion. `done` is a plain threading.Event; check_prefetch_progress polls it
+    (via a per-round TP MIN reduce over every rank's 0/1 done flag), so ranks whose
+    background GET finishes at different wall-clock times still run an identical,
+    balanced collective sequence."""
+
+    def __init__(self, hash_values, device_indices, sidecars=None, side_host=None):
+        self.hash_values = hash_values
+        self.device_indices = device_indices
+        # DSA/hybrid only: the sidecar PoolTransfers (indexer -> side_host staging)
+        # and the staging tensor to free after the H2D. None for dense bypass.
+        self.sidecars = sidecars
+        self.side_host = side_host
+        self.ok_pages = 0
+        self.error = None
+        self.done = threading.Event()
 
 
 class LayerLoadingEvent:
@@ -263,12 +317,31 @@ class HiCacheController:
         self.storage_backend_type = None
         self.enable_storage_metrics = enable_storage_metrics
 
+        # L2-bypass (device-direct write) prototype. `requested` reflects the env
+        # flag; `l2_bypass` is only turned on at attach once the backend advertises
+        # supports_device_transfer(). Off => byte-identical to stock.
+        self.l2_bypass_requested = env_l2_bypass()
+        self.l2_bypass = False
+        # Increment 3: async device-direct read. When l2_bypass is on and this is
+        # False (default), the on-demand read runs on a background thread; True
+        # keeps the increment-2 synchronous read. Inert unless l2_bypass.
+        self.l2_bypass_sync_read = env_l2_bypass_sync_read()
+        # Background device-load thread + its queue (created in _start_storage_
+        # threads only when l2_bypass and async read are on). None otherwise.
+        self.device_load_queue: Optional[Queue] = None
+        self.device_load_thread: Optional[threading.Thread] = None
+
         # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
         self.has_draft = False
         self.mem_pool_device_draft = None
         self.mem_pool_host_draft = None
         self.draft_page_get_func = None
         self.draft_page_set_func = None
+        # Task 6: EAGLE draft KV device-direct L3 under L2-bypass. Turned on at
+        # attach only if the backend exposes the device-draft ABI AND the draft GPU
+        # pool is a plain MLA/MHA (device-SG expressible, non-DSA). Off => draft L3
+        # stays disabled under bypass (honest degrade, as increments 1-3).
+        self.draft_device_enabled = False
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -382,6 +455,16 @@ class HiCacheController:
         self.prefetch_thread.start()
         self.backup_thread.start()
 
+        # Increment 3: the background device-load thread consumes DeviceLoadTasks
+        # (blocking SG GETs into GPU slots). Only spun up for async L2-bypass read;
+        # stock and sync-read paths never create it (byte-identical to stock off).
+        if self.l2_bypass and not self.l2_bypass_sync_read:
+            self.device_load_queue = Queue()
+            self.device_load_thread = threading.Thread(
+                target=self.device_load_thread_func, daemon=True
+            )
+            self.device_load_thread.start()
+
     def _stop_storage_threads(self):
         """Stop storage prefetch/backup threads and drain internal queues.
 
@@ -402,6 +485,8 @@ class HiCacheController:
                 self.backup_queue.put_nowait(None)
             if hasattr(self, "prefetch_buffer"):
                 self.prefetch_buffer.put_nowait(None)
+            if self.device_load_queue is not None:
+                self.device_load_queue.put_nowait(None)
         except Exception:
             pass
 
@@ -413,6 +498,8 @@ class HiCacheController:
             threads.append(self.backup_thread)
         if hasattr(self, "prefetch_io_aux_thread"):
             threads.append(self.prefetch_io_aux_thread)
+        if self.device_load_thread is not None:
+            threads.append(self.device_load_thread)
 
         for t in threads:
             try:
@@ -427,6 +514,11 @@ class HiCacheController:
                 [getattr(t, "name", repr(t)) for t in alive],
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
+
+        # Device-load thread has stopped (joined above); clear its handles so a
+        # subsequent attach re-creates a fresh thread + queue.
+        self.device_load_thread = None
+        self.device_load_queue = None
 
     def attach_storage_backend(
         self,
@@ -503,7 +595,28 @@ class HiCacheController:
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
 
+            self._maybe_enable_l2_bypass()
             self._maybe_register_draft_with_storage()
+            self._maybe_enable_device_draft()
+
+            if self.l2_bypass:
+                # Increment 3 (gate #1 re-anchor): the stock speculative-prefetch
+                # budget is 0.5 * host-pool tokens (staging L2). L2-bypass keeps no
+                # host staging for the main KV; the resource an in-flight read
+                # actually occupies is GPU KV slots. Re-anchor the rate-limit budget
+                # to a fraction of the DEVICE token capacity so
+                # prefetch_rate_limited() throttles new discoveries by GPU pressure,
+                # not by a host pool that bypass barely uses. 0.3x leaves headroom
+                # for running batches + write-through pins. prefetch_tokens_occupied
+                # is charged in device tokens by the async read path.
+                device_capacity = int(self.mem_pool_device_allocator.size)
+                self.prefetch_capacity_limit = int(0.3 * device_capacity)
+                logger.info(
+                    "HiCache L2-bypass: prefetch_capacity_limit re-anchored to "
+                    "0.3 * device token capacity = %d tokens (was 0.5 * host = %d).",
+                    self.prefetch_capacity_limit,
+                    int(0.5 * self.mem_pool_host.size),
+                )
 
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
@@ -531,6 +644,7 @@ class HiCacheController:
             self.page_set_func = self._generic_page_set
             self.draft_page_get_func = None
             self.draft_page_set_func = None
+            self.l2_bypass = False
             raise
 
     def detach_storage_backend(self):
@@ -574,6 +688,7 @@ class HiCacheController:
         self.page_set_func = self._generic_page_set
         self.draft_page_get_func = None
         self.draft_page_set_func = None
+        self.l2_bypass = False
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
 
@@ -657,6 +772,17 @@ class HiCacheController:
             self.ack_backup_queue.queue.clear()
             self.host_mem_release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
+            if self.device_load_thread is not None:
+                # Wake + join the background device-load thread, then drop its queue
+                # (any in-flight DeviceLoadTask is abandoned; the tree is being
+                # reset, so its GPU slots go with the pool wipe).
+                try:
+                    self.device_load_queue.put_nowait(None)
+                except Exception:
+                    pass
+                self.device_load_thread.join()
+                self.device_load_queue = None
+                self.device_load_thread = None
 
         self.storage_stop_event.clear()
 
@@ -669,6 +795,12 @@ class HiCacheController:
             )
             self.prefetch_thread.start()
             self.backup_thread.start()
+            if self.l2_bypass and not self.l2_bypass_sync_read:
+                self.device_load_queue = Queue()
+                self.device_load_thread = threading.Thread(
+                    target=self.device_load_thread_func, daemon=True
+                )
+                self.device_load_thread.start()
 
     def write(
         self,
@@ -688,8 +820,44 @@ class HiCacheController:
         self.start_writing()
         return host_indices
 
+    def write_device(
+        self,
+        device_indices: torch.Tensor,
+        priority: Optional[int] = None,
+        node_id: int = -1,
+    ) -> int:
+        """L2-bypass write-through: enqueue a device-only backup op. No host slot
+        is allocated (the GPU slot itself is the RDMA source, kept pinned via the
+        deferred unlock). Returns the node id as the ack handle (always succeeds;
+        there is no host allocation that can fail)."""
+        # Empty host placeholder keeps CacheOperation.merge_ops' torch.cat happy
+        # while carrying no host slot; start_writing skips all host I/O in bypass.
+        host_placeholder = device_indices.new_empty(0)
+        self.write_queue.append(
+            CacheOperation(host_placeholder, device_indices, node_id, priority)
+        )
+        self.start_writing()
+        return node_id
+
     def start_writing(self) -> None:
         if len(self.write_queue) == 0:
+            return
+
+        if self.l2_bypass:
+            # Device-direct: no D2H copy. Record empty start/finish events so the
+            # existing writing_check -> _finish_write_through_ack machinery still
+            # fires (which triggers the device->L3 storage backup and, on backup
+            # ack, the deferred device-slot unlock). The GPU slots stay pinned by
+            # the caller's inc_lock_ref until that backup ack.
+            op = CacheOperation.merge_ops(self.write_queue)
+            self.write_queue.clear()
+            start_event = device_module.Event()
+            finish_event = device_module.Event()
+            start_event.record()
+            finish_event.record()
+            self.ack_write_queue.append(
+                HiCacheAck(start_event, finish_event, op.node_ids)
+            )
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
@@ -757,6 +925,135 @@ class HiCacheController:
         )
         return device_indices
 
+    def load_device_direct(
+        self, hash_values: List[str], node_id: int = -1
+    ) -> tuple[Optional[torch.Tensor], int]:
+        """L2-bypass on-demand load: allocate GPU KV slots for len(hash_values)
+        pages and RDMA the pages straight into them via batch_set... no: via
+        batch_get_v1_device (a blocking scatter-gather GET; the NIC writes device
+        memory). No host staging, no separate H2D.
+
+        Returns (device_indices, ok_pages): ok_pages is the CONSECUTIVE hit prefix
+        from the start (KV must be a contiguous prefix — the first miss/short read
+        truncates it), so a transient partial failure just shortens the loaded
+        prefix and the caller recomputes the tail. (None, 0) if the device
+        allocation failed (caller may evict + retry, mirroring load()).
+
+        The fence: this call returns only after the RDMA completions are observed,
+        so the device slots hold the KV on return. start_loading() then records ONE
+        CUDA event so the compute stream orders after the device writes."""
+        npages = len(hash_values)
+        total_tokens = npages * self.page_size
+        device_indices = self.mem_pool_device_allocator.alloc(total_tokens)
+        if device_indices is None:
+            return None, 0
+        results = self.storage_backend.batch_get_v1_device(hash_values, device_indices)
+        # Task 6: best-effort device-direct draft GET into the draft GPU slots (sync
+        # read mode; the async path does the equivalent in _run_device_get).
+        if self.has_draft and self.draft_device_enabled:
+            try:
+                self.storage_backend.batch_get_v1_device_draft(
+                    hash_values, device_indices)
+            except Exception:
+                logger.debug("Device-direct draft L3 read failed (best-effort).",
+                             exc_info=True)
+        ok_pages = 0
+        for ok in results:
+            if not ok:
+                break
+            ok_pages += 1
+        return device_indices, ok_pages
+
+    def enqueue_device_load(
+        self, device_indices: torch.Tensor, node_ids: List[int]
+    ) -> None:
+        """L2-bypass: queue an already-loaded device span for start_loading()'s
+        fence pass. The RDMA GET already filled `device_indices` (in
+        load_device_direct); this op carries only the slots + node ids so
+        start_loading records the completion event on the load stream. The empty
+        host placeholder keeps CacheOperation.merge_ops' torch.cat happy."""
+        host_placeholder = device_indices.new_empty(0)
+        op = CacheOperation(host_placeholder, device_indices, -1)
+        op.node_ids = list(node_ids)
+        self.load_queue.append(op)
+
+    # ---- Increment 3: async device-direct read (background load thread) --------
+    #
+    # make_device_load_task / submit_device_load / _run_device_get /
+    # finalize_device_load / free_device_load split the increment-2 synchronous
+    # load_device_direct across the scheduler/background thread boundary:
+    #   scheduler thread : make_device_load_task (alloc GPU slots) -> submit ->
+    #                       [park] -> finalize (dense: no-op) + free suffix
+    #   background thread : _run_device_get (blocking SG GET + local verify)
+    # The dense (v1) versions live here; HybridCacheController overrides them for
+    # the DSA v2-device split value + sidecar H2D.
+
+    def make_device_load_task(
+        self, hash_values: List[str]
+    ) -> Optional["DeviceLoadTask"]:
+        """Allocate GPU KV slots for len(hash_values) pages (scheduler thread). No
+        GET yet. Returns None if the device allocation failed (the caller may evict
+        and retry, mirroring load()). No collective — the TP alloc-consistency MIN
+        is the caller's job."""
+        total_tokens = len(hash_values) * self.page_size
+        device_indices = self.mem_pool_device_allocator.alloc(total_tokens)
+        if device_indices is None:
+            return None
+        return DeviceLoadTask(hash_values, device_indices)
+
+    def submit_device_load(self, task: "DeviceLoadTask") -> None:
+        """Hand a built task to the background device-load thread (scheduler
+        thread). The thread will run the blocking GET and set task.done."""
+        self.device_load_queue.put(task)
+
+    def _run_device_get(self, task: "DeviceLoadTask") -> int:
+        """Background thread: the blocking scatter-gather GET into the pre-allocated
+        GPU slots + local hit-prefix count. Dense v1. No CUDA ops, no collective."""
+        results = self.storage_backend.batch_get_v1_device(
+            task.hash_values, task.device_indices
+        )
+        # Task 6: best-effort device-direct draft GET into the draft GPU slots (same
+        # slots), also pure RDMA — background-safe. Does not gate the target verify.
+        self._maybe_device_draft_get(task)
+        return consecutive_ok_pages(results, [], len(task.hash_values))
+
+    def finalize_device_load(self, task: "DeviceLoadTask", ok_pages: int) -> None:
+        """Scheduler thread, at promotion: dense bypass has nothing to finalize (the
+        SG GET already wrote the GPU slots). Hybrid overrides to H2D the sidecar."""
+        return
+
+    def free_device_load(self, task: "DeviceLoadTask") -> None:
+        """Free a task's GPU slots (abort path, scheduler thread). Idempotent."""
+        if task.device_indices is not None:
+            self.mem_pool_device_allocator.free(task.device_indices)
+            task.device_indices = None
+
+    def free_device_indices(self, device_indices: torch.Tensor) -> None:
+        """Free a span of device KV slots (used by the tree to release the unverified
+        suffix after a partial load). Base = the plain allocator; hybrid overrides to
+        the full-attn allocator that owns the main-KV slots."""
+        self.mem_pool_device_allocator.free(device_indices)
+
+    def device_load_thread_func(self):
+        """Background consumer of DeviceLoadTasks: run each blocking GET, record the
+        local verified page count, signal done. Never touches CUDA streams,
+        collectives, or the radix tree — those stay on the scheduler thread."""
+        while not self.storage_stop_event.is_set():
+            try:
+                task = self.device_load_queue.get(block=True, timeout=1)
+            except Empty:
+                continue
+            if task is None:
+                continue
+            try:
+                task.ok_pages = self._run_device_get(task)
+            except Exception as e:
+                logger.exception("device-direct background GET failed: %s", e)
+                task.error = e
+                task.ok_pages = 0
+            finally:
+                task.done.set()
+
     def move_indices(self, host_indices: torch.Tensor, device_indices: torch.Tensor):
         # move indices to GPU if using kernels, to host if using direct indexing
         if self.io_backend == "kernel":
@@ -782,6 +1079,33 @@ class HiCacheController:
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
             return -1
+
+        if self.l2_bypass:
+            # Device-direct: the KV was already RDMA'd into the GPU slots by
+            # load_device_direct (a blocking SG GET during init_load_back). There
+            # is no H2D copy to stream. Record ONE fence: mark every layer event
+            # complete on the load stream so the compute path's per-layer
+            # wait_until(i) orders after the NIC's device writes. The blocking GET
+            # already returned (writes observed), so recording the events here is
+            # the stream-side fence for the GPUDirect writes; there is no per-layer
+            # overlap (a single RDMA op filled all layers at once).
+            producer_id = self.layer_done_counter.update_producer()
+            op = CacheOperation.merge_ops(self.load_queue)
+            self.load_queue.clear()
+            producer_event = self.layer_done_counter.events[producer_id]
+            producer_event.start_event.record()
+            with device_module.stream(self.load_stream):
+                producer_event.start_event.wait(self.load_stream)
+                for i in range(self.layer_num):
+                    producer_event.complete(i)
+            self.ack_load_queue.append(
+                HiCacheAck(
+                    start_event=producer_event.start_event,
+                    finish_event=producer_event.finish_event,
+                    node_ids=op.node_ids,
+                )
+            )
+            return producer_id
 
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
@@ -859,6 +1183,75 @@ class HiCacheController:
         # If storage is already attached, wire up the draft I/O path now.
         # Otherwise this will be deferred until attach_storage_backend().
         self._maybe_register_draft_with_storage()
+        # Task 6: if bypass is already on, wire the device-direct draft L3 path too
+        # (attach may have run before the draft pool was registered).
+        self._maybe_enable_device_draft()
+
+    def _maybe_enable_l2_bypass(self) -> None:
+        """Turn on device-direct write only if requested AND the backend can RDMA
+        from GPU KV slots. Otherwise fall back to the stock host write path with a
+        clear warning. Called from attach after the zero-copy page funcs are set."""
+        self.l2_bypass = False
+        if not self.l2_bypass_requested:
+            return
+
+        supports = getattr(self.storage_backend, "supports_device_transfer", None)
+        if not (callable(supports) and supports()):
+            logger.warning(
+                "SGLANG_HICACHE_L2_BYPASS=1 but storage backend %r does not "
+                "advertise supports_device_transfer(); falling back to the stock "
+                "host (D2H) write path.",
+                self.storage_backend_type,
+            )
+            return
+
+        # Device-direct requires the same zero-copy v1 write surface the host path
+        # uses; the generic copy path has no device variant. Compare underlying
+        # functions: attribute access mints a fresh bound method each time, so an
+        # `is` check against `self._page_set_zero_copy` would never match.
+        if (
+            getattr(self.page_set_func, "__func__", self.page_set_func)
+            is not type(self)._page_set_zero_copy
+        ):
+            logger.warning(
+                "SGLANG_HICACHE_L2_BYPASS=1 requires the zero-copy v1 write path "
+                "(backend %r is on the generic copy path); falling back to the "
+                "stock host write path.",
+                self.storage_backend_type,
+            )
+            return
+
+        # Per-pool device meta: the GPU KV pool must be expressible as layer-first
+        # scatter-gather segments (MLA/MHA, incl. the DSA main latent). A pool the
+        # device_page_meta module cannot express (e.g. a future exotic layout) keeps
+        # the stock host path even if the backend advertises the ABI.
+        from sglang.srt.mem_cache import device_page_meta
+
+        if not device_page_meta.supported(self.mem_pool_device):
+            logger.warning(
+                "SGLANG_HICACHE_L2_BYPASS=1 but the GPU KV pool %r is not "
+                "expressible as device page meta; falling back to the stock host "
+                "write path.",
+                type(self.mem_pool_device).__name__,
+            )
+            return
+
+        try:
+            self.storage_backend.register_mem_pool_device(self.mem_pool_device)
+        except Exception:
+            logger.exception(
+                "Failed to register GPU KV pool for device-direct write; falling "
+                "back to the stock host write path."
+            )
+            return
+
+        self.l2_bypass = True
+        self.page_set_func = self._page_set_zero_copy_device
+        logger.info(
+            "HiCache L2-bypass ENABLED: write-through RDMAs straight from GPU KV "
+            "slots to L3 (no D2H). Backend=%r. Read path is unchanged.",
+            self.storage_backend_type,
+        )
 
     def _maybe_register_draft_with_storage(self) -> None:
         """Pick the draft L3 IO implementation."""
@@ -896,6 +1289,108 @@ class HiCacheController:
         # Generic backends.
         self.draft_page_get_func = self._draft_page_get_generic
         self.draft_page_set_func = self._draft_page_set_generic
+
+    def _maybe_enable_device_draft(self) -> None:
+        """Task 6: turn on device-direct draft KV L3 under L2-bypass.
+
+        Under bypass there is no host D2H for the target, so the stock draft L3 path
+        (which reads/writes the draft HOST pool) has nothing to stage. Instead the
+        draft KV is RDMA'd straight from/into the draft GPU pool's slots (the same
+        slots the target rode). Enabled only if: bypass is on, a draft is registered,
+        the backend exposes the device-draft ABI (register_mem_pool_device_draft +
+        batch_set/get_v1_device_draft), AND the draft GPU pool's MAIN latent is a
+        device-SG-expressible MLA/MHA.
+
+        DSA DRAFT (GLM-5.2): a DSA draft is a DSATokenToKVPool — its main latent IS a
+        real MLA latent (device-expressible) but it ALSO carries an indexer sidecar
+        (index_k_with_scale_buffer). The original task-6 gate declined it outright
+        (`use_dsa` veto) because loading the latent WITHOUT the matching indexer would
+        give the draft's sparse attention a garbage index → worse acceptance than
+        recompute. We now lift that veto: the draft's indexer is the SAME layer-first,
+        page-indexed shape as the target's (increment 4), so we device-register it too
+        and the draft KV is coherent (latent + indexer) on an L3 hit. The gate is:
+        for a DSA draft, the backend must expose register_mem_pool_device_draft_sidecar
+        AND device_page_meta.sidecar_supported(draft pool) must hold; if either is
+        missing we DECLINE honestly (leave draft L3 off) rather than serve a half page.
+        A dense (non-DSA) draft is unaffected — latent only, no sidecar.
+
+        Best-effort: any miss logs once and leaves draft L3 disabled (recompute-safe)."""
+        self.draft_device_enabled = False
+        if not (self.l2_bypass and self.has_draft and self.enable_storage):
+            return
+        backend = self.storage_backend
+        if not all(
+            callable(getattr(backend, m, None))
+            for m in ("register_mem_pool_device_draft",
+                      "batch_set_v1_device_draft", "batch_get_v1_device_draft")
+        ):
+            logger.info(
+                "HiCache draft L3 stays OFF under L2-bypass: backend %r lacks the "
+                "device-draft ABI.", self.storage_backend_type)
+            return
+        from sglang.srt.mem_cache import device_page_meta
+
+        draft_pool = self.mem_pool_device_draft
+        if not device_page_meta.supported(draft_pool):
+            logger.info(
+                "HiCache draft L3 stays OFF under L2-bypass: draft GPU pool %r main "
+                "latent is not device-SG-expressible.", type(draft_pool).__name__)
+            return
+        # DSA draft: the indexer sidecar must also be device-registrable, else decline.
+        draft_is_dsa = bool(getattr(draft_pool, "use_dsa", False))
+        if draft_is_dsa and not (
+            callable(getattr(backend, "register_mem_pool_device_draft_sidecar", None))
+            and device_page_meta.sidecar_supported(draft_pool)
+        ):
+            logger.info(
+                "HiCache draft L3 stays OFF under L2-bypass: DSA draft pool %r has an "
+                "indexer sidecar that this backend/geometry cannot device-register "
+                "(a latent-only DSA draft would corrupt the draft indexer — declining "
+                "is the honest choice).", type(draft_pool).__name__)
+            return
+        try:
+            backend.register_mem_pool_device_draft(draft_pool)
+            if draft_is_dsa:
+                backend.register_mem_pool_device_draft_sidecar(draft_pool)
+        except Exception:
+            logger.exception(
+                "Failed to register draft GPU pool for device-direct draft L3; "
+                "leaving draft L3 off under bypass.")
+            return
+        self.draft_device_enabled = True
+        logger.info(
+            "HiCache draft L3 ENABLED under L2-bypass: draft KV RDMAs device-direct "
+            "(best-effort) alongside the target%s. Backend=%r.",
+            " (DSA: latent + indexer sidecar)" if draft_is_dsa else "",
+            self.storage_backend_type)
+
+    def _draft_device_set(self, hash_values, device_indices) -> None:
+        """Best-effort device-direct draft L3 write (task 6). Mirrors _draft_page_set
+        but RDMAs from the draft GPU pool's slots (device_indices)."""
+        if not self.draft_device_enabled:
+            return
+        try:
+            self.storage_backend.batch_set_v1_device_draft(hash_values, device_indices)
+        except Exception:
+            logger.debug(
+                "Device-direct draft L3 write failed (best-effort), skipping.",
+                exc_info=True)
+
+    def _maybe_device_draft_get(self, task: "DeviceLoadTask") -> None:
+        """Best-effort device-direct draft L3 read (task 6), run on the background
+        device-load thread alongside the target GET (pure RDMA into the draft GPU
+        slots — no CUDA, no collective, so it is background-safe). Failure just means
+        the draft model recomputes those pages (EAGLE verifies against the target, so
+        a missing/partial draft only lowers acceptance, never correctness)."""
+        if not self.draft_device_enabled:
+            return
+        try:
+            self.storage_backend.batch_get_v1_device_draft(
+                task.hash_values, task.device_indices)
+        except Exception:
+            logger.debug(
+                "Device-direct draft L3 read failed (best-effort), skipping.",
+                exc_info=True)
 
     def prefetch(
         self,
@@ -1103,6 +1598,23 @@ class HiCacheController:
         self.backup_queue.put(operation)
         return operation.id
 
+    def write_storage_device(
+        self,
+        device_indices: torch.Tensor,
+        token_ids: List[int],
+        hash_value: Optional[List[str]] = None,
+        prefix_keys: Optional[List[str]] = None,
+    ) -> int:
+        """L2-bypass backup: same as write_storage, but the operation's
+        `host_indices` field carries DEVICE slot indices. The backup thread's
+        page_set_func (_page_set_zero_copy_device) reads device page meta and
+        RDMAs straight from the GPU KV slots."""
+        operation = StorageOperation(
+            device_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
+        )
+        self.backup_queue.put(operation)
+        return operation.id
+
     # todo: deprecate
     def _generic_page_set(self, hash_values, host_indices, extra_info=None) -> bool:
         data = [
@@ -1114,6 +1626,18 @@ class HiCacheController:
     def _page_set_zero_copy(self, hash_values, host_indices, extra_info=None) -> bool:
         return all(
             self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
+        )
+
+    def _page_set_zero_copy_device(
+        self, hash_values, device_indices, extra_info=None
+    ) -> bool:
+        # L2-bypass: `device_indices` are GPU slot indices (StorageOperation carried
+        # them in its host_indices field via write_storage_device). The backend
+        # reads device page meta and RDMAs from the GPU pool.
+        return all(
+            self.storage_backend.batch_set_v1_device(
+                hash_values, device_indices, extra_info
+            )
         )
 
     def _draft_page_set(self, hash_values, host_indices) -> None:
@@ -1201,9 +1725,17 @@ class HiCacheController:
                 )
                 break
 
-            # Best-effort draft L3 write alongside target.
+            # Best-effort draft L3 write alongside target. Under L2-bypass the draft
+            # host pool holds no data (no D2H staging), so the draft rides the
+            # device-direct path (task 6): batch_host_indices carries the GPU slot
+            # indices in bypass. Off bypass, the stock host draft path is used. If
+            # device-draft could not be enabled (non-expressible/DSA draft pool),
+            # draft L3 simply stays off (recompute-safe).
             if self.has_draft:
-                self._draft_page_set(batch_hashes, batch_host_indices)
+                if self.l2_bypass:
+                    self._draft_device_set(batch_hashes, batch_host_indices)
+                else:
+                    self._draft_page_set(batch_hashes, batch_host_indices)
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes

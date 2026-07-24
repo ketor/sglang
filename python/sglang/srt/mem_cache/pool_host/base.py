@@ -10,6 +10,10 @@ import psutil
 import torch
 
 from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.mem_cache.pool_host.bypass import (
+    _L2_BYPASS_STUB_PAGES,
+    l2_bypass_stub_applies,
+)
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
@@ -101,7 +105,12 @@ class HostKVCache(abc.ABC):
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
-        if host_size > 0:
+        # L2-bypass: replace the --hicache-size pinned sizing with a minimal stub;
+        # --hicache-size is ignored. Stock branches below are byte-identical.
+        self.l2_bypass_stub = l2_bypass_stub_applies(device_pool)
+        if self.l2_bypass_stub:
+            self.size = _L2_BYPASS_STUB_PAGES * self.page_size
+        elif host_size > 0:
             self.size = sync_fixed_hicache_size(
                 int(host_size * 1e9 // self.size_per_token), host_size
             )
@@ -113,30 +122,43 @@ class HostKVCache(abc.ABC):
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
-        if self.size <= device_pool.size:
-            logger.warning(
-                "HiCache host KV pool (%d tokens) is smaller than the device pool (%d tokens);"
-                "L2 cache effectiveness is reduced."
-                "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
-                self.size,
-                device_pool.size,
-            )
-
-        # Verify there is enough available host memory.
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory available. Requesting "
-                f"{requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
-                f"size of the hierarchical cache."
+        if self.l2_bypass_stub:
+            # No hicache-size warning, no big-memory check: the stub is a few MB
+            # and is never load-bearing (bypass never allocates a host slot).
+            logger.info(
+                "HiCache L2-bypass stub host pool (%s): --hicache-size ignored, "
+                "host footprint ~%.1f MB (%d tokens x %d B/token); GPUDirect "
+                "GPU<->L3 owns the data path.",
+                type(self).__name__,
+                requested_bytes / 1e6,
+                self.size,
+                self.size_per_token,
             )
         else:
-            logger.info(
-                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
-            )
+            if self.size <= device_pool.size:
+                logger.warning(
+                    "HiCache host KV pool (%d tokens) is smaller than the device pool (%d tokens);"
+                    "L2 cache effectiveness is reduced."
+                    "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
+                    self.size,
+                    device_pool.size,
+                )
+
+            # Verify there is enough available host memory.
+            host_mem = psutil.virtual_memory()
+            available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+            if requested_bytes > available_bytes:
+                raise ValueError(
+                    f"Not enough host memory available. Requesting "
+                    f"{requested_bytes / 1e9:.2f} GB but only have "
+                    f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
+                    f"size of the hierarchical cache."
+                )
+            else:
+                logger.info(
+                    f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
+                )
 
         self.kv_buffer = self.init_kv_buffer()
 
