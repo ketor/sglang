@@ -94,6 +94,20 @@ def env_l2_bypass_sync_read() -> bool:
     ).strip().lower() not in ("", "0", "false", "no", "off")
 
 
+def env_l2_bypass_fuse_draft() -> bool:
+    """Increment 7: SGLANG_HICACHE_L2_BYPASS_FUSE_DRAFT=0 reverts the EAGLE draft
+    L3 IO to its own RDMA round trip (the increment-4/5 standalone
+    batch_set/get_v1_device_draft calls). Default ON => the draft's sub-keys ride
+    INSIDE the target page's scatter-gather batch, so draft L3 adds no RDMA op.
+    Same keys, same bytes, same results either way — purely an op-count knob, kept
+    so the draft-fusion effect can be A/B'd without redeploying. Only meaningful
+    when SGLANG_HICACHE_L2_BYPASS=1 and the backend advertises
+    supports_fused_draft_device()."""
+    return os.environ.get(
+        "SGLANG_HICACHE_L2_BYPASS_FUSE_DRAFT", "1"
+    ).strip().lower() not in ("", "0", "false", "no", "off")
+
+
 class DeviceLoadTask:
     """L2-bypass async read (increment 3): one on-demand device-direct load handed
     to the background device-load thread.
@@ -244,6 +258,66 @@ class StorageOperation:
         return self.id < other.id
 
 
+class DevicePinCancelMixin:
+    """Start/cancel arbitration for an L2-bypass device->L3 backup op.
+
+    Such an op's `host_indices` field carries GPU KV slot indices, and those slots
+    stay pinned unevictable (lock_ref) until the op acks. Because that pin outlives
+    the scheduler step and depends on an external backend, it needs an escape hatch
+    for when the ack never comes. `try_start` / `try_cancel` are the two ends of
+    that hatch and are mutually exclusive under one lock:
+
+      * the backup thread calls `try_start()` before issuing the PUT — a False
+        means the reaper already released the slots, so the RDMA must NOT run
+        (reading a slot the tree has since handed to another request would publish
+        that request's KV under this page's hash — silent wrong-KV on every later
+        read);
+      * the stale-pin reaper calls `try_cancel()` — a False means the PUT is
+        already in flight and the pin must be held.
+
+    Only bypass device backups pay for the lock; the stock host path keeps using
+    the plain StorageOperation.
+    """
+
+    def _init_pin_state(self) -> None:
+        self._pin_state_lock = threading.Lock()
+        self.started = False
+        self.cancelled = False
+
+    def try_start(self) -> bool:
+        """Backup thread: claim the op for a PUT. False if it was cancelled."""
+        with self._pin_state_lock:
+            if self.cancelled:
+                return False
+            self.started = True
+            return True
+
+    def try_cancel(self) -> bool:
+        """Reaper (scheduler thread): claim the op for release. False if the PUT
+        already started, in which case the pin must stay."""
+        with self._pin_state_lock:
+            if self.started:
+                return False
+            self.cancelled = True
+            return True
+
+
+class DeviceStorageOperation(DevicePinCancelMixin, StorageOperation):
+    """Dense L2-bypass device->L3 backup op. See DevicePinCancelMixin."""
+
+    def __init__(
+        self,
+        device_indices: torch.Tensor,
+        token_ids: List[int],
+        hash_value: Optional[List[str]] = None,
+        prefix_keys: Optional[List[str]] = None,
+    ):
+        self._init_pin_state()
+        super().__init__(
+            device_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
+        )
+
+
 class PrefetchOperation(StorageOperation):
     def __init__(
         self,
@@ -330,6 +404,15 @@ class HiCacheController:
         # threads only when l2_bypass and async read are on). None otherwise.
         self.device_load_queue: Optional[Queue] = None
         self.device_load_thread: Optional[threading.Thread] = None
+        # L2-bypass device-pin health counters. Under bypass the GPU KV slot is the
+        # RDMA source for the device->L3 PUT, so it stays lock_ref'd until that PUT
+        # acks — the one lock in the design whose release depends on something
+        # outside this process. These make every way that ack can go wrong countable
+        # instead of silent. Always zero off bypass.
+        self.backup_failed_ops = 0  # PUT raised; acked anyway to free the slots
+        self.backup_cancelled_ops = 0  # reaper reclaimed the pin before the PUT ran
+        self.backup_thread_restarts = 0  # backup thread died and was respawned
+        self.backup_force_acked_ops = 0  # backlog force-acked after a thread death
 
         # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
         self.has_draft = False
@@ -342,6 +425,11 @@ class HiCacheController:
         # pool is a plain MLA/MHA (device-SG expressible, non-DSA). Off => draft L3
         # stays disabled under bypass (honest degrade, as increments 1-3).
         self.draft_device_enabled = False
+        # Increment 7: when True the draft rides the target's SG batch (no
+        # standalone draft RDMA op). Requested by env, granted at attach only if
+        # the backend advertises supports_fused_draft_device().
+        self.draft_fuse_requested = env_l2_bypass_fuse_draft()
+        self.draft_device_fused = False
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -947,10 +1035,15 @@ class HiCacheController:
         device_indices = self.mem_pool_device_allocator.alloc(total_tokens)
         if device_indices is None:
             return None, 0
-        results = self.storage_backend.batch_get_v1_device(hash_values, device_indices)
+        results = self.storage_backend.batch_get_v1_device(
+            hash_values, device_indices,
+            with_draft=self.draft_rides_target_batch,
+        )
         # Task 6: best-effort device-direct draft GET into the draft GPU slots (sync
-        # read mode; the async path does the equivalent in _run_device_get).
-        if self.has_draft and self.draft_device_enabled:
+        # read mode; the async path does the equivalent in _run_device_get). Skipped
+        # when fused (increment 7) — the GET above already carried the draft.
+        if (self.has_draft and self.draft_device_enabled
+                and not self.draft_device_fused):
             try:
                 self.storage_backend.batch_get_v1_device_draft(
                     hash_values, device_indices)
@@ -1010,7 +1103,8 @@ class HiCacheController:
         """Background thread: the blocking scatter-gather GET into the pre-allocated
         GPU slots + local hit-prefix count. Dense v1. No CUDA ops, no collective."""
         results = self.storage_backend.batch_get_v1_device(
-            task.hash_values, task.device_indices
+            task.hash_values, task.device_indices,
+            with_draft=self.draft_rides_target_batch,
         )
         # Task 6: best-effort device-direct draft GET into the draft GPU slots (same
         # slots), also pure RDMA — background-safe. Does not gate the target verify.
@@ -1316,6 +1410,7 @@ class HiCacheController:
 
         Best-effort: any miss logs once and leaves draft L3 disabled (recompute-safe)."""
         self.draft_device_enabled = False
+        self.draft_device_fused = False
         if not (self.l2_bypass and self.has_draft and self.enable_storage):
             return
         backend = self.storage_backend
@@ -1358,16 +1453,36 @@ class HiCacheController:
                 "leaving draft L3 off under bypass.")
             return
         self.draft_device_enabled = True
+        # Increment 7: fuse the draft into the target's SG batch when the backend
+        # can carry it (same page hashes, same device slots, distinct namespace),
+        # so draft L3 costs zero extra RDMA ops on the backup and load paths.
+        self.draft_device_fused = bool(
+            self.draft_fuse_requested
+            and callable(getattr(backend, "supports_fused_draft_device", None))
+            and backend.supports_fused_draft_device()
+        )
         logger.info(
             "HiCache draft L3 ENABLED under L2-bypass: draft KV RDMAs device-direct "
-            "(best-effort) alongside the target%s. Backend=%r.",
+            "(best-effort) alongside the target%s, %s. Backend=%r.",
             " (DSA: latent + indexer sidecar)" if draft_is_dsa else "",
+            "FUSED into the target SG batch (no extra RDMA op)"
+            if self.draft_device_fused else "in its own RDMA op (unfused)",
             self.storage_backend_type)
+
+    @property
+    def draft_rides_target_batch(self) -> bool:
+        """Increment 7: True when the draft's sub-keys are carried by the target's
+        own device SG batch (`with_draft=True`), so the standalone draft ops below
+        must NOT also run. Read by the backup/load call sites."""
+        return self.draft_device_enabled and self.draft_device_fused
 
     def _draft_device_set(self, hash_values, device_indices) -> None:
         """Best-effort device-direct draft L3 write (task 6). Mirrors _draft_page_set
         but RDMAs from the draft GPU pool's slots (device_indices)."""
-        if not self.draft_device_enabled:
+        if not self.draft_device_enabled or self.draft_device_fused:
+            # Fused (increment 7): the target's batch_set_*_device already carried
+            # the draft sub-keys in the same SG put — a second op here would be a
+            # pure duplicate.
             return
         try:
             self.storage_backend.batch_set_v1_device_draft(hash_values, device_indices)
@@ -1382,7 +1497,9 @@ class HiCacheController:
         slots — no CUDA, no collective, so it is background-safe). Failure just means
         the draft model recomputes those pages (EAGLE verifies against the target, so
         a missing/partial draft only lowers acceptance, never correctness)."""
-        if not self.draft_device_enabled:
+        if not self.draft_device_enabled or self.draft_device_fused:
+            # Fused (increment 7): the target's batch_get_*_device already carried
+            # the draft sub-keys in the same SG GET.
             return
         try:
             self.storage_backend.batch_get_v1_device_draft(
@@ -1604,16 +1721,20 @@ class HiCacheController:
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
-    ) -> int:
+    ) -> DeviceStorageOperation:
         """L2-bypass backup: same as write_storage, but the operation's
         `host_indices` field carries DEVICE slot indices. The backup thread's
         page_set_func (_page_set_zero_copy_device) reads device page meta and
-        RDMAs straight from the GPU KV slots."""
-        operation = StorageOperation(
+        RDMAs straight from the GPU KV slots.
+
+        Returns the OPERATION (not just its id, as write_storage does): the caller
+        holds the GPU slots pinned until this op acks and needs the handle to
+        cancel it if the ack never comes."""
+        operation = DeviceStorageOperation(
             device_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
         )
         self.backup_queue.put(operation)
-        return operation.id
+        return operation
 
     # todo: deprecate
     def _generic_page_set(self, hash_values, host_indices, extra_info=None) -> bool:
@@ -1634,9 +1755,13 @@ class HiCacheController:
         # L2-bypass: `device_indices` are GPU slot indices (StorageOperation carried
         # them in its host_indices field via write_storage_device). The backend
         # reads device page meta and RDMAs from the GPU pool.
+        # Increment 7: with_draft asks the backend to carry the EAGLE draft's
+        # sub-keys in this same SG put (same hashes, same slots) instead of a
+        # second RDMA op; _draft_device_set is then inert. Inert when unfused.
         return all(
             self.storage_backend.batch_set_v1_device(
-                hash_values, device_indices, extra_info
+                hash_values, device_indices, extra_info,
+                with_draft=self.draft_rides_target_batch,
             )
         )
 
@@ -1752,8 +1877,95 @@ class HiCacheController:
                     continue
 
                 if not self.backup_skip:
-                    self._page_backup(operation)
+                    if isinstance(operation, DevicePinCancelMixin):
+                        self._run_device_backup(operation)
+                    else:
+                        self._page_backup(operation)
                 self.ack_backup_queue.put(operation)
 
             except Empty:
                 continue
+
+    def recover_dead_backup_thread(self) -> int:
+        """L2-bypass watchdog: if the backup thread died, force-ack its backlog and
+        respawn it. Returns the number of ops force-acked (0 when healthy).
+
+        The backup thread holds GPU KV pins: every queued op's slots stay
+        unevictable until it acks. If the thread is gone, nothing will ever ack
+        them, so the pool bleeds down until the scheduler wedges. `_run_device_backup`
+        makes ordinary backend errors survivable; this covers what it cannot
+        (BaseException, a killed thread, a bug in the loop itself).
+
+        Force-acking the backlog is safe precisely BECAUSE the thread is dead: no
+        PUT can be in flight, so no NIC is reading the slots we are about to unpin.
+        The ops are acked, not run, so their pages simply recompute. Draining in
+        FIFO order keeps `ack_backup_queue` the same sequence on every rank, which
+        is what the MIN-gated drain in the tree relies on.
+        """
+        if not self.enable_storage or not self.l2_bypass:
+            return 0
+        thread = self.backup_thread
+        if thread is None or thread.is_alive() or self.storage_stop_event.is_set():
+            return 0
+
+        forced = 0
+        while True:
+            try:
+                operation = self.backup_queue.get_nowait()
+            except Empty:
+                break
+            if operation is None:
+                continue
+            self.ack_backup_queue.put(operation)
+            forced += 1
+
+        self.backup_force_acked_ops += forced
+        self.backup_thread_restarts += 1
+        self.backup_thread = threading.Thread(
+            target=self.backup_thread_func, daemon=True
+        )
+        self.backup_thread.start()
+        logger.error(
+            "L2-bypass: the storage backup thread had DIED; force-acked %d queued "
+            "op(s) to release their GPU KV pins and respawned it (restart #%d). "
+            "Those pages were not written to L3 and will recompute.",
+            forced,
+            self.backup_thread_restarts,
+        )
+        return forced
+
+    def _run_device_backup(self, operation) -> None:
+        """L2-bypass backup body. Two things the stock path does not need:
+
+        1. **Cancel arbitration.** If the stale-pin reaper already released this
+           op's GPU slots, the tree may have handed them to another request — the
+           PUT must not read them (it would store that request's KV under this
+           page's hash). `try_start()` losing the race is the signal to skip.
+        2. **The ack is mandatory.** Off bypass, this op's ack only drops a host
+           protection; under bypass it is the ONLY thing that unpins the GPU KV
+           slots. A backend exception must therefore never kill this thread nor
+           drop the ack — that is a monotonic, unrecoverable device-memory leak
+           that wedges the instance (zero running requests, 99% pool usage).
+           Off bypass this method is not reached at all, so stock behavior
+           (fail-fast, thread dies) is unchanged.
+        """
+        if not operation.try_start():
+            self.backup_cancelled_ops += 1
+            logger.warning(
+                "device->L3 backup op %d was cancelled (stale pin reclaimed); "
+                "skipping the PUT, its %d pages recompute.",
+                operation.id,
+                len(operation.hash_value),
+            )
+            return
+        try:
+            self._page_backup(operation)
+        except Exception:
+            self.backup_failed_ops += 1
+            logger.exception(
+                "device->L3 backup op %d raised; acking anyway so its GPU KV slots "
+                "are released (%d/%d tokens written).",
+                operation.id,
+                operation.completed_tokens,
+                len(operation.hash_value) * self.page_size,
+            )

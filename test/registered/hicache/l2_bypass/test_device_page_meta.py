@@ -7,6 +7,7 @@ registration. Pure python: run with `python3 test_device_page_meta.py`.
 """
 import unittest
 
+
 from sglang.srt.mem_cache import device_page_meta as dpm  # noqa: E402
 
 
