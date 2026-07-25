@@ -13,6 +13,7 @@ emitted collective-tag sequences are identical. Pure python; run with
 """
 import unittest
 
+
 from sglang.srt.mem_cache.device_page_meta import consecutive_ok_pages  # noqa: E402
 
 

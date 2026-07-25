@@ -36,6 +36,8 @@ read-only over the matching site-packages file):
 -v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/hiradix_cache.py:$SGLANG/srt/mem_cache/hiradix_cache.py:ro
 -v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/hicache_storage.py:$SGLANG/srt/mem_cache/hicache_storage.py:ro
 -v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/device_page_meta.py:$SGLANG/srt/mem_cache/device_page_meta.py:ro
+-v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/l3_marker_state.py:$SGLANG/srt/mem_cache/l3_marker_state.py:ro
+-v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/device_pin_ledger.py:$SGLANG/srt/mem_cache/device_pin_ledger.py:ro
 -v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/managers/cache_controller.py:$SGLANG/srt/managers/cache_controller.py:ro
 -v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/hybrid_cache/hybrid_cache_controller.py:$SGLANG/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py:ro
 -v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/pool_host/base.py:$SGLANG/srt/mem_cache/pool_host/base.py:ro
@@ -973,20 +975,56 @@ inline sizing (not the base path), so it is doubly excluded.
 - **`HostPoolGroup.size`**: inherits the stubbed anchor.
 - **`available_size()` reads** (hiradix prefetch shrink path): return the tiny free
   count → the None-handling shrink/skip path fires. Recompute-safe.
-- **`draft_host_pool.size`** (cache_controller:1149): log string only.
+- **`draft_host_pool.size`** (cache_controller `set_draft_kv_pool`): log string only —
+  but the draft pool's SLOT COUNT is load-bearing (target host_indices are used on
+  it verbatim), hence the process-shared stub count below.
 - **Slot-range asserts**: `alloc` only asserts `need_size % page_size == 0` and
   returns None when `need_size > available` — no hard assert on `size`. Staging
   buffers use `min(page_num, 64)` with `page_num >= 1` → no divide-by-zero.
 
 ## Sizing math
-Stub `self.size = _L2_BYPASS_STUB_PAGES * page_size` (raw), then the UNCHANGED
-stock page-align (`page_num = size // page_size + 1; size = page_num * page_size`)
-→ `(_L2_BYPASS_STUB_PAGES + 1) * page_size` tokens = 2 pages at
-`_L2_BYPASS_STUB_PAGES=1`. Positive, page-aligned, non-zero for any page size (the
-`< 4GB` divide-by-zero the operator hit was the GB→token conversion underflowing /
-downstream framework asserts; the stub sets the token count directly and never
-touches that path). At a GLM-5.2-ish ~45 KB/token main latent + page 64, the main
-buffer is ~5.8 MB; the indexer + draft add a few MB more — total tens of MB.
+Stub `self.size = max(_L2_BYPASS_STUB_PAGES, layer_num) * page_size` (raw), then the
+UNCHANGED stock page-align (`page_num = size // page_size + 1;
+size = page_num * page_size`). Positive, page-aligned, non-zero for any page size
+(the `< 4GB` divide-by-zero the operator hit was the GB→token conversion
+underflowing / downstream framework asserts; the stub sets the token count directly
+and never touches that path). At GLM-5.2 (78 layers, ~44.9 KB/token main latent,
+page 64) the main buffer is ~227 MB, the DSA indexer ~53 MB, the EAGLE draft a few
+MB — a few hundred MB total, against ~100 GB for an unstubbed `--hicache-size`.
+
+### Why the floor is `layer_num` pages, not 1 (fixes the on-node IndexError)
+The first cut used a flat 1 page and the scheduler died at construction:
+`IndexError: index 2 is out of bounds for dimension 0 with size 2`
+(`memory_pool_host.py:1295`). Root cause: **page-major layouts put `page_num` in
+dim0**, but the stock subclass constructors still build per-layer views out of that
+same dim0:
+
+| layout | buffer dim0 | per-layer view |
+|---|---|---|
+| MLA `layer_first` (`memory_pool_host.py:1325`) | `layer_num` | `kv_buffer[i]`, in range |
+| MLA `page_first` (`:1331`) | `size` | `transpose(0,1)[i]` (`:1293`), in range |
+| **MLA `page_first_direct` (`:1338`) / `page_first_kv_split` (`:1348`)** | **`page_num`** | **`kv_buffer[i] for i in range(layer_num)` (`:1295`)** |
+| **MHA `page_first_direct` (`:154`) / `page_head` (`:163`)** | **`page_num`** | **`k/v_buffer[i] ... range(layer_num)` (`:126-127`)** |
+
+Those page-major per-layer views are only ever in range because a real host pool has
+`page_num >> layer_num`; nothing in stock enforces it. The production node runs
+`--hicache-mem-layout page_first_direct`, so a 2-page stub with `layer_num=78` blew
+up immediately. The floor (`page_num = pages + 1 >= layer_num`, one page of margin)
+restores that implicit invariant **by capacity alone** — buffer shapes, layouts and
+dimension semantics stay exactly stock, no new branch in `memory_pool_host.py`.
+
+### Why the stub slot count is process-shared
+The draft host pool is deliberately built with
+`host_to_device_ratio = primary.size / draft_device.size` so its slot count matches
+the target host pool 1-to-1 (`kv_cache_builder.py:101-110`), and the controller then
+indexes the draft pool with the *target's* `host_indices`
+(`cache_controller.py:888` `backup_from_device_all_layer`, `:1716` `get_data_page`).
+The stub ignores ratio/`--hicache-size`, so a per-pool `layer_num` floor alone would
+give the 78-layer target 79 pages and the 1-layer EAGLE draft 1 page — a real
+out-of-range risk on the residual (bypass-declined) host path.
+`l2_bypass_shared_stub_raw_tokens` therefore memoizes one monotonic-max token count
+per `page_size` for the whole process; the target is constructed first (the draft
+registers against an existing tree cache), so every later stub pool reuses it.
 
 ## `--hicache-size` semantics under bypass+stub
 `--hicache-size` becomes **irrelevant** — the stub ignores it and logs so at
@@ -999,17 +1037,22 @@ demonstration; increment 6 makes the shrink automatic and total.)
 
 ## Changed files / functions (increment 6)
 ### mem_cache/pool_host/bypass.py (NEW, pure — no torch/sglang at module load)
-- `_L2_BYPASS_STUB_PAGES = 1`; `env_l2_bypass_requested()`;
-  `l2_bypass_stub_raw_tokens(page_size)` / `l2_bypass_stub_tokens(page_size)` (the
-  pre-/post-align token counts, exposed for tests);
+- `_L2_BYPASS_STUB_PAGES = 1` (floor); `env_l2_bypass_requested()`;
+  `l2_bypass_stub_pages(layer_num)` — `max(_L2_BYPASS_STUB_PAGES, layer_num)`, the
+  page-major dim0 invariant above; `l2_bypass_stub_raw_tokens(page_size, layer_num)`
+  / `l2_bypass_stub_tokens(page_size, layer_num)` (pure pre-/post-align token counts,
+  exposed for tests); `l2_bypass_shared_stub_raw_tokens(page_size, layer_num)` — the
+  process-shared monotonic-max count the constructor uses (+
+  `reset_l2_bypass_stub_sizing()` for tests);
   `l2_bypass_stub_applies(device_pool)` — the gate (env flag AND lazy
   `device_page_meta.supported`; any import failure → False = keep real pool).
 
 ### mem_cache/pool_host/base.py
 - `HostKVCache.__init__` — compute `self.l2_bypass_stub = l2_bypass_stub_applies(
-  device_pool)`; when set, size from `_L2_BYPASS_STUB_PAGES` instead of
+  device_pool)`; when set, size from
+  `l2_bypass_shared_stub_raw_tokens(page_size, device_pool.layer_num)` instead of
   `--hicache-size`/ratio and skip the big-memory warning+check in favor of the stub
-  log. **Stock branches are byte-identical, merely re-indented under `else:`**; with
+  log (which also reports `page_num` and `layer_num`). **Stock branches are byte-identical, merely re-indented under `else:`**; with
   the flag off `l2_bypass_stub` is False (env short-circuit, no device_page_meta
   import) and the original path runs verbatim.
 
@@ -1017,9 +1060,14 @@ demonstration; increment 6 makes the shrink automatic and total.)
 `tests/test_l2_bypass_stub.py` (pure python, no GPU/torch): env-flag parser
 (truthy/falsy/whitespace), stub token count is positive+page-aligned+non-zero for
 page sizes 1..256, final == raw + page_size (matches the constructor align),
-footprint stays tens-of-MB, and the gate short-circuits on the env flag /
+footprint stays small, and the gate short-circuits on the env flag /
 defers to a (fake-injected) `device_page_meta.supported` / declines on
-missing-module. 11 tests pass. The base constructor's torch-coupled allocation is
+missing-module. Plus the post-crash invariants: `page_num >= layer_num` for every
+(page_size 1..256) x (layer_num 1..126) pair including the exact GLM-5.2 regression
+case (64/78), the floor stays capacity-only (page-aligned, `final == raw +
+page_size`), the default `layer_num` keeps the 1-page stub, footprint stays well
+under a GB, and the shared slot count makes the 1-layer draft match the 78-layer
+target (monotonic max, per-page_size, resettable). 21 tests pass. The base constructor's torch-coupled allocation is
 py_compile + review only (no GPU on the dev box), as increments 1-5.
 
 ## Known limitations / deviations (increment 6)
@@ -1033,3 +1081,494 @@ py_compile + review only (no GPU on the dev box), as increments 1-5.
   This only affects a config that requests bypass on a backend that cannot honor it;
   the production node (dfkv device-direct) always enables bypass. Documented, not
   hidden.
+
+---
+
+# Increment 7 — FUSE the EAGLE draft into the target's SG batch (draft L3 costs no extra RDMA op)
+
+One change on top of increments 1/2/2.5/3/4/5/6, still guarded by
+`SGLANG_HICACHE_L2_BYPASS=1` (with it off, byte-identical to stock). **No new
+bind-mount files** — the SGLang changes live in the already-mounted
+`managers/cache_controller.py`, `mem_cache/hybrid_cache/hybrid_cache_controller.py`
+and `mem_cache/hicache_storage.py`, plus the existing dfkv backend mount.
+
+## What this is NOT (diagnosis first — two proposed fixes were provably no-ops)
+
+The brief was "draft-L3 re-writes hot pages every decode; add a dedup gate like the
+main KV's `l3_backed`". Reading the shipped paths, **that premise does not hold and
+two of the three proposed routes would have changed nothing**:
+
+1. **There is no draft-only write path.** `_draft_device_set` is called from exactly
+   two places — `HiCacheController._page_backup` (dense) and
+   `HybridCacheController._page_backup_device` (DSA) — both INSIDE the per-batch loop
+   of a storage backup operation. A backup op only exists if
+   `hiradix._inc_hit_count` → `write_backup` → `_write_backup_device` ran, and that is
+   already gated by
+   `already_backed = node.backuped or (l2_bypass and _node_l3_backed(node))`
+   (`hiradix_cache.py:1108`). **Draft writes are a strict subset of main-KV
+   write-through events**, so they cannot fire "every decode step" while the main KV
+   stays quiet. Route (a) `draft_l3_backed` and route (b) "reuse the main
+   `l3_backed`" are therefore both no-ops: (b) IS the status quo, and (a) would be a
+   second marker on the same node with the same lifetime.
+2. **Route (c) — the dfkv exist-dedup gate — is already wired on the draft path.**
+   `batch_set_v1_device_draft` puts through `_put_sg_flat`
+   (`dfkv_hicache.py:939`), whose `_backup_exist_gate` (default on,
+   `DFKV_BACKUP_EXIST_GATE`) probes first and skips every already-present sub-key;
+   the draft indexer goes through `_sidecar_device_set` → the same `_put_sg_flat`.
+   So a genuinely redundant draft PUT already costs a probe and zero bytes.
+
+**What draft-L3 actually costs in a hot round is RDMA OP COUNT, not bytes.** With the
+draft on, a DSA backup batch issued 4 exist probes + up to 4 SG puts (target latent,
+target indexer, draft latent, draft indexer) instead of 2 + 2, and — the one that
+sits on the TTFT critical path — an async device LOAD issued 4 SG GETs instead of 2,
+on the background load thread every rank waits for. The draft's bytes are ~1.3% of a
+page (GLM-5.2: draft latent 576 B/token + indexer 128 B/token vs the target's
+44,928 + 9,984), but it **doubled the ops**.
+
+## The change: same keys, same bytes, half the ops
+
+The draft is addressed by *exactly* the same page hashes and the same device slot
+indices as the target (it rides the slots the target rode); only the key namespace
+differs (`.draft_k` / `draft_indexer`). So its sub-keys can simply be **appended to
+the target's scatter-gather batch** instead of getting their own round trip. Nothing
+about what lands in L3 changes — which is why **R3 is preserved by construction**
+(proven both directions by the roundtrip tests below: fused-written pages read back
+through the standalone draft ABI and vice versa).
+
+New sub-flag `SGLANG_HICACHE_L2_BYPASS_FUSE_DRAFT` (default **1** = fused). Set to 0
+to revert to the increment-4/5 standalone draft ops for a single-variable A/B without
+redeploying.
+
+### mem_cache/hicache_storage.py (base hooks, inert defaults)
+- `supports_fused_draft_device()` (NEW) → `False`; only dfkv overrides.
+- `batch_set_v1_device` / `batch_get_v1_device` / `batch_set_v2_device` /
+  `batch_get_v2_device` — added `with_draft: bool = False` to the signatures.
+
+### managers/cache_controller.py
+- `env_l2_bypass_fuse_draft()` (NEW module fn); `self.draft_fuse_requested`,
+  `self.draft_device_fused` (`__init__`).
+- `_maybe_enable_device_draft` — resets `draft_device_fused=False` at entry, and on
+  success grants it when the env flag is on AND the backend advertises
+  `supports_fused_draft_device()`. The enable log now states FUSED / unfused.
+- `draft_rides_target_batch` (NEW property) = `draft_device_enabled and
+  draft_device_fused` — the single switch every call site reads.
+- `_draft_device_set` / `_maybe_device_draft_get` — return early when fused (the
+  target's batch already carried the draft; a second op would be a pure duplicate).
+- `_page_set_zero_copy_device` (dense backup), `load_device_direct` (sync read),
+  `_run_device_get` (async read) — pass `with_draft=self.draft_rides_target_batch`.
+
+### mem_cache/hybrid_cache/hybrid_cache_controller.py
+- `_page_backup_device`, `load_device_direct`, `_run_device_get` — pass
+  `with_draft=self.draft_rides_target_batch` to `batch_set_v2_device` /
+  `batch_get_v2_device`.
+
+### dfkv backend `integration/hicache/dfkv_hicache.py` (branch feat/hicache-device-direct-put)
+- `supports_fused_draft_device()` (NEW) → True (capability probe).
+- `_draft_device_flat(keys, device_indices, putting)` (NEW) — builds the draft's flat
+  SG group (latent `@sg` sub-keys + , for a DSA draft, the `draft_indexer` sub-keys)
+  from the SAME keys/indices, or returns None when it must not fuse (see the rank-skip
+  guard below).
+- `_fused_draft_or_fallback(...)` (NEW) — returns the group, or runs the standalone
+  `batch_set/get_v1_device_draft` and returns None. Best-effort (swallows), because
+  the SGLang side has already skipped its own call.
+- `_kv_device_set` / `_kv_device_get` — new `extra=(sks, ptrs, sizes)` param appended
+  to the one batch; the fold and the byte count are sliced back to the MAIN prefix so
+  the target's per-page results and the `on_set`/`on_get` byte attribution are
+  unchanged (the draft's bytes belong to no target metric).
+- `batch_set_v1_device` / `batch_get_v1_device` / `batch_set_v2_device` /
+  `batch_get_v2_device` — new `with_draft=False` param. `batch_set_v1_device` now
+  delegates its body to `_kv_device_set` (identical logic, no duplication).
+- `batch_set_v1_device_draft` / `batch_get_v1_device_draft` are UNCHANGED and remain
+  the fallback + the existing tests' entry point.
+
+## 🔴 The rank-skip guard (the one correctness trap)
+Fusing merges two skip decisions into one, so it is only sound when they agree:
+- target write: skipped on `is_mla and tp_rank != 0` (replicated MLA latent);
+- draft latent write: skipped on `draft_sub == 1 and tp_rank != 0` — the draft's own
+  MLA-ness, which is INDEPENDENT of the target's.
+
+`_draft_device_flat(putting=True)` returns None when `(draft_sub == 1) != is_mla`
+(e.g. MLA target + MHA draft), and the caller keeps the standalone draft op so its
+semantics are untouched. GLM-5.2 (MLA target + MLA MTP draft) and dense+dense both
+agree, so both fuse. The draft **indexer** skips on `is_mla` (it goes through the
+shared `_sidecar_device_set`), i.e. identical to the target's, so once the latent
+check passes the whole group is skip-compatible. **Reads have no rank skip anywhere**,
+so a read always fuses.
+
+## TP-consistency (unchanged invariant)
+No collective sequence changed — this is entirely below the collective layer. The
+fused write/read are local RDMA on the backup / background-load threads exactly as
+before; the async read's balanced per-round done-MIN / alloc-MIN / pages-MIN
+(increment 3) are untouched. The draft's per-page results are still discarded by the
+caller (best-effort), so a draft miss cannot truncate the target's verified prefix —
+asserted by `test_fused_read_of_absent_draft_still_serves_the_target`.
+
+## Tests
+dfkv `test/python/test_dfkv_hicache_device_direct.py` (+11, `-k hicache` 99 → **110**):
+- real cache node: `test_fused_draft_write_is_readable_by_the_unfused_draft_path`
+  and `test_unfused_draft_write_is_readable_by_the_fused_read` (**the R3-preservation
+  proof, both directions** — a fused write is byte-exact through the standalone ABI
+  and vice versa, which is the actual cross-restart shape),
+  `test_fused_v2_device_roundtrip_all_four_components` (DSA: target latent + target
+  indexer + draft latent + draft indexer all byte-exact in one put + one get),
+  `test_fused_read_of_absent_draft_still_serves_the_target`.
+- pure `TestFusedDraftGrouping` (7): which sub-keys get fused (DSA vs dense), decline
+  with no draft pool, **the put-side rank-skip disagreement declines while the get
+  fuses**, the fallback really issues the standalone op, and the op-count collapse —
+  `{exist:3, put:3} → {exist:1, put:1}` and 2 SG GETs → 1.
+- Mutation-checked: corrupting the fused key namespace fails 5 of the new tests.
+
+SGLang `patched/tests/test_fused_draft_gate.py` (NEW, 9 tests, torch-free): the env
+parser, the `draft_rides_target_batch` decision table, the standalone ops being its
+exact complement (so the draft is never written twice nor lost), best-effort failure
+swallowing, and a source-level guard that all four device call sites pass
+`with_draft=`. These AST-extract and execute the REAL function bodies from the
+shipped files rather than re-implementing them. `py_compile` clean on all patched
+files; increments 3/4/6 unit tests still pass (13 / 9 / 11).
+
+## Known limitations / deviations (increment 7)
+- **The 13% R2 figure in the brief is not attributable to the draft WRITE.** It came
+  from comparing two builds (increment 4's DSA-draft decline vs increment 5's
+  device-direct DSA draft) in single runs, on a metric the campaign itself measured
+  as noisy (R2 4G 38,098 vs 32G 45,339 = a 16% swing recorded as "single-run noise",
+  台账 三期). The op-count analysis above is the mechanism this increment removes;
+  the GPU A/B (`SGLANG_HICACHE_L2_BYPASS_FUSE_DRAFT=1` vs `0`, EAGLE, R1/R2/R3) is
+  what will size it. It is a strict op reduction with identical L3 content, so the
+  downside is bounded at "no measurable change".
+- **Target latent and target indexer are still two ops.** Fusing those as well would
+  halve the op count again even with the draft off, but it would change the draft-off
+  arm too and muddy this A/B. Deliberately left as a follow-up.
+- **SGLang side is py_compile + review + torch-free unit tests only** (no GPU on the
+  dev box), as increments 1-6; the byte-exact claim is proven on the dfkv side
+  against a real cache node.
+- **A pre-existing asymmetry worth knowing** (not introduced or changed here): the
+  draft latent's write rank-skip keys off the DRAFT pool's `sub`, while the draft
+  indexer's keys off the TARGET's `is_mla`. They coincide for every shape currently
+  deployed; a mixed MLA/MHA target-draft pair would write the draft indexer on ranks
+  that skip the draft latent. The increment-7 guard declines fusion for exactly that
+  pair, so it does not make the asymmetry worse.
+
+---
+
+# Increment 7.1 (hotfix) — the L3 marker state machine has no gaps
+
+**Crash it fixes** (100k×16 C8, GLM-5.2 DSA + EAGLE + bypass, HICACHE=4, after
+several restart→warmup→bench cycles; 8/8 ranks down, instance DOWN):
+
+```
+mem_cache/hiradix_cache.py, match_prefix
+    assert self.l2_bypass and self._node_l3_resident(last_node), (
+AssertionError: evicted non-backuped node 2 outside L2-bypass
+```
+
+## 🔴 New bind-mount file
+
+`mem_cache/l3_marker_state.py` is NEW (torch-free, unit-tested; same treatment as
+`device_page_meta.py`). **`hiradix_cache.py` imports it — mount it or the server
+will not start.** The line is already in the bind-mount block at the top.
+
+## Root cause (one function)
+
+`_drop_l3_markers` cleared `l3_present` **unconditionally** but only detached the
+node when it was childless:
+
+```python
+for n in reversed(nodes):
+    n.l3_present = False                      # <-- always
+    if n.value is None and len(n.children) == 0 and n.parent is not None:
+        ...detach...                          # <-- only sometimes
+```
+
+A marker that had acquired a child — another request discovering a different
+suffix under the same shared prefix inserts a SIBLING under it
+(`_insert_helper_l3`) — therefore stayed in the tree with `value=None`,
+`host_value=None`, `l3_present=False`, `l3_backed=False`. That is a **gap**: an
+evicted node whose KV is nowhere. The bypass tree's invariant is "an evicted
+in-tree node is backuped or L3-resident", and `match_prefix`'s climb asserted it.
+Any later request matching *through* the gap (its descendants are live markers,
+so this is the common case) crashed the scheduler.
+
+Why only after several bench cycles: it needs (a) a warm L3 so discovery
+materializes markers at all, (b) a branched tree — the 16 prompts must have split
+the shared prefix into sibling branches, which only exists after the first pass,
+and (c) one marker-drop event (0-verified / partial-verify / alloc-fail /
+abort). Node id 2 in the traceback is the top-level shared-prefix marker, i.e.
+the first node the first discovery created — which is exactly the node with the
+most siblings.
+
+## Fix
+
+- **Root cause** — `l3_marker_state.prune_l3_markers` never leaves a gap. A
+  marker that cannot be detached (has children) **keeps its L3 claim**; a marker
+  another request's GET still owns (`in_flight_ids`, derived from
+  `_bypass_load_state`) is left alone too — detaching it would have that load
+  promote a node no longer in the tree and leak its GPU slots. Only nodes that
+  are genuinely removable are cleared and popped.
+- **Bounded fallback** (production must not die on cache metadata) — the assert
+  is gone. `climb_evicted_chain` treats a gap as a hard **miss boundary**: the
+  hit length restarts above it and the load-back start node moves above it. The
+  same rule in `collect_loadable_chain` (both the sync `load_from_storage_device`
+  and the async `_start_l3_async_load` chain walks, which had the same assert):
+  hitting a gap discards everything collected below it. Gaps are counted
+  (`_l3_gap_count`) and logged throttled (first, then every 100th).
+- **Eviction** — `_evict_write_through` now skips a bypass device leaf that still
+  has children. "Device leaf" means *all children evicted*, and in bypass those
+  children are L3 markers still in the tree, so `_evict_regular` (which asserts
+  leafness and deletes the node) would have been a second crash / an orphaned
+  marker subtree. Unreachable with the flag off: a stock evicted child is
+  backuped, which makes its parent backuped, so the parent takes
+  `_evict_backuped`.
+
+## The concurrency half: two requests loading one chain
+
+The lead's reproduction narrowed it further — **concurrent** warmup (mixed
+lengths, 4-way parallel) crashes every time, **serial** warmup never does. That
+is the mechanism above, sharpened: with requests in flight simultaneously over a
+shared prefix, one request's deeper markers are *children* of another's chain, so
+a drop by any of them strands the shared ancestors. Serially, a chain is a clean
+leaf chain and detaches without residue — which is exactly why v1 never
+reproduced.
+
+The same overlap has a second consequence — ⚠️ **inferred from code reading, NOT
+observed**: the crash-era logs were lost when the container was rebuilt on the
+fixed build, so this one is neither confirmed nor refuted by evidence (the
+`match_prefix` assert above IS evidenced, 16 occurrences). It is fixed here
+because the reasoning holds and the fix is cheap, not because it was seen.
+
+`_start_l3_async_load` collects the chain by climbing from the deepest matched
+node, so request 2's chain **contains request 1's still-in-flight markers**, and
+a request whose match lands on in-flight markers takes the SYNC fallback
+(`schedule_policy.py:1105` → `init_load_back` → `load_from_storage_device`) over
+the very same nodes. When both loads land:
+
+- the later one **overwrites `n.value`**, orphaning the slots the tree (and the
+  other request) is already using — a device-memory bleed that can only appear
+  under concurrency, and
+- both register `ongoing_load_back[same node id]`, while `loading_check:1171`
+  does `self.ongoing_load_back.pop(ack_id)` **once per ack** — so the second ack
+  would pop a missing key (`KeyError`, scheduler down) or, at best, leave an
+  unmatched `inc_lock_ref` pinning the node forever.
+
+Fix: `l3_marker_state.plan_promotion` + `_apply_promotion` publish only nodes
+that are **still evicted**. A node already carrying slots means a concurrent
+request (or a recompute + `insert()`) published it first; the tree's slots win,
+ours are freed, and publishing stops there so the freed remainder stays a
+contiguous suffix of the buffer. If nothing is left to publish, no fence, no ack
+and no lock are registered — which is precisely the case that would otherwise
+double-register. Markers inside the verified prefix are never dropped by the
+supersede break (the drop boundary follows verification, not publication).
+
+## Safety: a gap can only shrink a match, never fake a hit
+
+The verification of KV content is unchanged and stays where it was — at load
+time (`consecutive_ok_pages` per page + the cross-rank MIN in
+`_promote_l3_async_load` / `load_from_storage_device`). Markers were never
+evidence of content, only a claim, so keeping a claim on an undetachable node
+cannot make a page be served: the next load re-verifies it and, if it really is
+gone, drops it again (detaching it that time, once the children are gone) and the
+tokens recompute. In the other direction, every gap branch only ever REMOVES
+nodes from the hit (`host_hit_length` restarts at 0 above the gap;
+`nodes_to_load.clear()`), and `host_hit_length` is a scheduling budget hint
+(`schedule_policy.py:1043`), so under-reporting is always safe. Nothing new is
+marked device-resident anywhere in this change.
+
+## TP-consistency (unchanged invariant)
+
+No collective added, removed or reordered. The new early return in
+`load_from_storage_device` (empty chain) and the gap branches are decided purely
+from tree state, and the tree is TP-symmetric: every marker drop comes from a
+POST-MIN decision (alloc MIN, verified-pages MIN) or from an abort, which is
+broadcast to all ranks. So all ranks take the same branch, exactly as the
+pre-existing `if not nodes_to_load:` early return already assumed.
+
+## Changed files / functions
+
+- `mem_cache/l3_marker_state.py` — **NEW**: `node_l3_backed/_present/_resident`,
+  `climb_evicted_chain`, `collect_loadable_chain`, `plan_promotion`,
+  `prune_l3_markers`.
+- `mem_cache/hiradix_cache.py` — `match_prefix` (assert → gap-tolerant climb),
+  `_drop_l3_markers` (delegates to `prune_l3_markers` + in-flight set),
+  `load_from_storage_device` / `_start_l3_async_load` (chain walk → 
+  `collect_loadable_chain`, asserts gone), `_promote_l3_async_load` /
+  `load_from_storage_device` publish via `plan_promotion` + `_apply_promotion`
+  (never clobber a concurrently published node), `_evict_write_through` (bypass
+  children guard), `_log_l3_gap` + `_l3_gap_count` (new), `_node_l3_*` (thin
+  delegates).
+
+## Tests
+
+`patched/tests/test_l3_marker_state.py` (NEW, 32 tests, torch-free): the drop
+paths (childless / sibling branch / device-resident / in-flight / already
+detached / l3_backed+present / partial-suffix) each asserted to leave **no gap in
+the tree**; the climb with gaps at the top level, directly under the device
+prefix, mid-chain and doubled; `collect_loadable_chain` discarding below a gap
+and treating a hash-less marker as a gap; flag-off equivalence on a host-backed
+chain; and the end-to-end production sequence (discover → sibling → failed drop →
+later match); plus `plan_promotion` — full/partial verify, a node only partly
+covered by the verified prefix, and the concurrency cases (supersede mid-chain,
+fully superseded, superseded node keeps ITS slots, an evicted node behind a
+supersede is neither published nor dropped). The pre-fix logic run against the
+same fake tree reproduces `evicted non-backuped node 2 outside L2-bypass`
+verbatim.
+
+`py_compile` clean; increments 3/4/6/7 suites still pass (13 / 9 / 21 / 9).
+Reproduction to re-run after the fix: `warmup.sh` v2 (concurrent, mixed lengths)
+— the serial v1 never triggered any of this.
+
+## Known limitations (increment 7.1)
+
+- A kept claim on an undetachable marker costs one futile SG GET per request
+  until a recompute rehydrates the node (`insert()` refills evicted nodes it
+  walks through, which also re-marks it `l3_backed` on write-through). Bounded
+  and self-healing, and it only happens when the page truly left L3.
+- `_evict_write_through`'s skip can under-evict when many device leaves carry
+  marker children. It returns fewer tokens; the caller retries/retracts as it
+  already does. Never observed to matter at HICACHE=4 (markers resolve within a
+  round or two), but it is the reason `_l3_gap_count` is worth watching.
+- Not GPU-verified on this box (no torch) — same standing caveat as increments
+  1-7.
+
+---
+
+# Increment 7.2 — bound the deferred device pin (GPU KV slot leak / pool wedge)
+
+Fixes the long-soak wedge: after 8-10 rounds the instance stopped with
+
+```
+Prefill batch, #new-seq: 1, #new-token: 64, #cached-token: 0, token usage: 0.99,
+#running-req: 0, #queue-req: 0
+```
+
+— **no requests running or queued, yet the KV pool 99% full**, health checks
+failing, never recovering. No assert, no crash, no GPU-memory growth: the tokens
+were not lost, they were *locked*.
+
+## Root cause: the one lock released by an external event
+
+Increment 1 made the GPU KV slot the RDMA source for its own device->L3 backup,
+so it must stay unevictable until that PUT completes. The pin is therefore taken
+at write-through enqueue (`hiradix_cache._write_backup_device` -> `inc_lock_ref`)
+and released only at the **storage backup ack** (`_drain_backup` ->
+`dec_lock_ref`), five hops later:
+
+```
+_write_backup_device        inc_lock_ref(node)          [scheduler]
+  -> ongoing_write_through
+  -> writing_check -> _finish_write_through_ack
+  -> _write_backup_storage_device -> ongoing_backup[op.id]
+  -> backup_thread_func -> _page_backup -> batch_set_v*_device   [backup thread]
+  -> ack_backup_queue
+  -> _drain_backup            dec_lock_ref(node)        [scheduler]
+```
+
+Stock never has this exposure. There the pin is released at the *D2H* ack — local,
+bounded, CUDA-event-driven — and the storage backup only holds a `protect_host()`,
+which cannot wedge device memory. Under bypass the same chain holds HBM, and it
+has an unguarded break in the middle: `backup_thread_func`
+(`managers/cache_controller.py:1838`) catches only `Empty`, so **any** exception
+out of `_page_backup` / `_page_backup_device` (i.e. out of the dfkv
+`batch_set_v1_device` / `batch_set_v2_device` call) kills the backup thread. From
+that instant nothing ever acks again: every subsequent write-through pins its
+slots permanently, `protected_size_` climbs monotonically, `evictable_size_` goes
+to zero, and `PrefillAdder`'s `available_size() + evictable_size()` reaches zero
+— which is precisely "zero requests, 99% usage, wedged". Abrupt onset after N
+healthy rounds is the signature of a single fatal op, not of gradual pressure.
+
+Two smaller holds on the same theme, both unbounded, were found alongside it:
+
+* `_poll_l3_async_load` parked a request forever if its background GET never
+  returned. A parked request is in the waiting queue, so it is never scheduled and
+  never aborted — its GPU slots and ancestor pin had no release path at all.
+* `_abort_async_load` waited 30s for the GET then **freed the slots regardless**.
+  On a stall that hands slots the NIC is still writing back to the allocator:
+  silent wrong-KV, not just a leak.
+
+## Fix
+
+**1. The ack becomes mandatory** (`cache_controller._run_device_backup`). Bypass
+device backups run through a body that always acks, whatever the backend does.
+Off bypass the method is not reached and a raising `_page_backup` still kills the
+thread exactly as stock — flag-off behavior unchanged.
+
+**2. Thread-death recovery** (`cache_controller.recover_dead_backup_thread`,
+called from `drain_storage_control_queues`). If the thread dies anyway
+(BaseException, kill), its backlog is force-acked and the thread respawned. Safe
+*because* the thread is dead: no PUT can be in flight, so no NIC is reading the
+slots being unpinned. FIFO drain keeps `ack_backup_queue` identical across ranks.
+
+**3. Stale-pin reaper** (`hiradix_cache._reap_stale_device_pins`, deadline
+`SGLANG_HICACHE_L2_BYPASS_PIN_TIMEOUT_S`, default 120s). Backstop for any lost ack
+we have not diagnosed. Two invariants:
+
+* *No RDMA under the reclaim.* A pin is released only if `try_cancel()` beats the
+  backup thread's `try_start()` (`DevicePinCancelMixin`, one lock, mutually
+  exclusive). An op whose PUT already began keeps its pin and is only counted —
+  freeing it would let the NIC publish another request's KV under this page's
+  hash. One stuck PUT blocks one op, not the backlog.
+* *TP symmetry.* The reap count is the cross-rank MIN (4th slot of the existing
+  `drain_storage_control_queues` all_reduce, so no extra collective) and
+  `DevicePinLedger.reapable` yields stale pins oldest-op-id first — every rank
+  releases the same pins in the same order, no `dec_lock_ref` divergence.
+
+A reclaimed page never reached L3, so its `l3_backed` claim is cleared and it
+recomputes: a hit-rate cost, not a correctness one.
+
+**4. Async-load deadline + deferred slot free.** `_poll_l3_async_load` carries a
+negated stall flag inside its existing MIN reduce (an OR: one stalled rank aborts
+all, still one collective per round; `SGLANG_HICACHE_L2_BYPASS_LOAD_TIMEOUT_S`,
+default 180s). `_abort_async_load` no longer blocks and no longer frees under an
+in-flight GET — the task is parked in `_orphaned_device_tasks` and swept once
+`done` fires, FIFO, under a cross-rank MIN (5th slot of the same all_reduce) so
+allocator state stays identical across ranks. Deferred, never dropped.
+
+## Observability
+
+- `device_pin_census()` — pending backup ops, pinned tokens, oldest pin age,
+  reclaimed/stuck counts, backup-thread alive + restart count, protected vs
+  evictable size, in-flight loads.
+- `_check_device_pin_health()` (every step, throttled 30s, no tree walk) warns
+  once pins exceed 30s or 25% of the pool — the *leading edge* of a wedge.
+- `_log_device_pin_audit()` fires when eviction falls short and answers the
+  question directly: locked tokens split into *by pending L3 backup* / *by
+  in-flight load* / **UNACCOUNTED** with sample node ids. Unaccounted > 0 is a
+  `lock_ref` nothing will release — exactly the "lock_ref>0 with no in-flight
+  task" signal, and where to look next time.
+
+## Files
+
+- `mem_cache/device_pin_ledger.py` (NEW, torch-free) — ledger + `audit_pins`.
+  **Needs a new bind-mount** (added to the list above).
+- `managers/cache_controller.py` — `DevicePinCancelMixin`,
+  `DeviceStorageOperation`, `_run_device_backup`, `recover_dead_backup_thread`,
+  health counters. `write_storage_device` now returns the operation (bypass-only
+  method, single caller) so the tree can cancel it.
+- `mem_cache/hybrid_cache/hybrid_cache_controller.py` — DSA
+  `DeviceStorageOperation` (the indexer sidecar rides the same slots, so one pin
+  covers both and one cancel protects both).
+- `mem_cache/hiradix_cache.py` — ledger wiring, reaper, orphan sweep, async-load
+  deadline, census/audit.
+
+## Flag-off equivalence
+
+Every hunk is behind `self.l2_bypass` or on a bypass-only method. The one
+unconditional change is the `drain_storage_control_queues` all_reduce going from
+3 to 5 elements: deliberately fixed-shape regardless of the flag, because
+`l2_bypass` is resolved per-rank at attach and a flag-dependent tensor shape would
+hang NCCL if ranks ever disagreed.
+
+## Tests
+
+`tests/test_device_pin_ledger.py` (NEW, 27 cases, pure python): ledger
+bookkeeping; reap order is oldest-op-first (the TP-symmetry property); the
+cancel/start arbitration is exclusive under 200 rounds of real thread
+contention; and a lock-balance harness covering every exit path — normal ack,
+lost ack reclaimed by deadline, late ack after a reap, reap after an ack,
+in-flight PUT keeps its pin then releases normally, one stuck op not blocking the
+backlog, MIN-capped reap taking the oldest prefix, mixed sequences, and
+thread-death drain — each asserting the chain's `lock_ref` returns to zero and the
+ledger empties. Plus `audit_pins` attribution incl. the orphan case.
+
+`py_compile` clean. All 5 existing suites still pass (marker state / async read /
+device page meta / fused draft gate / stub host pool).
+
+Not GPU-verified on this box (no torch) — same standing caveat as increments 1-7.
